@@ -1,0 +1,10 @@
+# GUI
+PySide6>=6.5
+pyqtgraph>=0.13
+numpy>=1.21
+
+# Optional, used by the v4l2 backend frame grabber and mp4 preview export.
+# On the Jetson, prefer the system OpenCV that ships with JetPack:
+#   sudo apt-get install python3-opencv
+# and install the rest with: pip install -r requirements.txt --no-deps PySide6 pyqtgraph
+opencv-python>=4.5 ; platform_machine != "aarch64"

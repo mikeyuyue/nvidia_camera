@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Recordings / data
+recordings/
+*.raw
+*.mp4
+*.npy
+*.tiff
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
