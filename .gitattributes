@@ -1,0 +1,6 @@
+# Normalize line endings: dev on Windows, deploy/run on the Jetson (Linux).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.raw binary
+*.mp4 binary
