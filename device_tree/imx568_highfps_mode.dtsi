@@ -1,0 +1,106 @@
+/*
+ * High-frame-rate mode entry for the VC MIPI IMX568 on Jetson Orin Nano (cam0).
+ * 2 CSI lanes (D-PHY). Target: 608x104 ROI, up to ~1000 fps.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * WHAT THIS DOES (and does NOT do)
+ * ───────────────────────────────────────────────────────────────────────────
+ * This block configures the *Tegra VI/CSI capture side* and the *bounds* the
+ * driver advertises (resolution, bit depth, lanes, pixel clock, max framerate).
+ * On a VC MIPI camera the actual sensor register programming (ROI, blanking,
+ * binning, exposure) is done at RUNTIME by the VC module MCU via the v4l2
+ * controls (frame_rate, exposure, binning_mode, ...). So:
+ *
+ *   - This mode raises the CEILING. It does not by itself make the sensor run
+ *     faster than its firmware allows.
+ *   - You still set the actual rate at runtime: --set-ctrl=frame_rate=...
+ *   - Confirm with Vision Components that the IMX568 module supports your target
+ *     rate at this ROI on 2 lanes. The DT cannot exceed the module's real limit.
+ *
+ * Before flashing this, try runtime cropping on the EXISTING tree first:
+ *   v4l2-ctl -d /dev/video0 --set-fmt-video=width=608,height=104,pixelformat=RG10 \
+ *     --set-ctrl=frame_rate=1000 --stream-mmap --stream-count=1000 --stream-to=/dev/shm/x.raw
+ * If that already gives a high fps, you may not need this at all.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * THE TIMING MATH (fill in from the IMX568 datasheet / VC support)
+ * ───────────────────────────────────────────────────────────────────────────
+ * Anchor from your hardware: full-res mode caps at ~42.05 fps on 2 lanes
+ * (frame_rate control max = 42050 = fps x 1000).
+ *
+ *   line_rate  = max_fps_fullres * V_total_fullres
+ *              ~= 42.05 * (2064 + V_blank_full)        [lines/sec]
+ *   line_time  = 1 / line_rate
+ *   frame_time = V_total * line_time = (active_h + V_blank) * line_time
+ *   fps        = 1 / frame_time
+ *
+ * With ~42 fps at full res, cropping height to 104 (small V_blank) lands you
+ * around ~600 fps at the CURRENT pixel clock. To reach 1000 fps at 608x104 you
+ * need ONE of:
+ *   (a) reduce active_h further (~50-86 rows), or
+ *   (b) 2x2 binning (binning_mode=1) — roughly halves readout time, or
+ *   (c) raise pix_clk_hz below (~1.6x) so line_time drops — REQUIRES the IMX568
+ *       to actually support the higher pixel clock; check with VC.
+ *
+ * Required pixel clock for a target fps:
+ *   pix_clk_hz = line_length * V_total * target_fps
+ * Example: line_length=700, V_total=104+40=144, target=1000
+ *   pix_clk_hz = 700 * 144 * 1000 = 100,800,000  (~101 MHz)
+ *
+ * MIPI sanity check (2 lanes must carry it — they easily do here):
+ *   mipi_total = pix_clk_hz * csi_pixel_bit_depth = 100.8e6 * 10 = 1.008 Gbit/s
+ *   per_lane   = mipi_total / num_lanes = 504 Mbit/s  (well under D-PHY limits)
+ *
+ * Values marked <<CONFIRM>> must come from the IMX568 datasheet or VC; the rest
+ * follow the standard Tegra tegracam mode-table schema.
+ */
+
+mode_imx568_608x104_hs {
+    mclk_khz = "24000";
+    num_lanes = "2";
+    tegra_sinterface = "serial_a";   /* cam0; verify against your DT's port */
+    phy_mode = "DPHY";
+    discontinuous_clk = "no";
+    dpcm_enable = "false";
+    cil_settletime = "0";
+
+    /* pixel format */
+    dynamic_pixel_bit_depth = "10";
+    csi_pixel_bit_depth = "10";
+    mode_type = "bayer";             /* mono sensor; RG10 phase kept for ISP */
+    pixel_phase = "rggb";
+
+    /* geometry */
+    active_w = "608";
+    active_h = "104";                /* lower to ~50-86 for 1000 fps w/o clock bump */
+    readout_orientation = "0";
+    line_length = "700";             /* <<CONFIRM>> H_total for this width */
+    inherent_gain = "1";
+
+    /* clocks — pix_clk_hz = line_length * V_total * target_fps */
+    pix_clk_hz = "100800000";        /* <<CONFIRM>> sensor must support it */
+    serdes_pix_clk_hz = "504000000"; /* = pix_clk_hz * bit_depth / num_lanes */
+
+    /* gain — maps to the 'gain' control (0..48001 step 100 on this rig) */
+    gain_factor = "1000";
+    min_gain_val = "0";
+    max_gain_val = "48000";
+    step_gain_val = "100";
+    default_gain = "0";
+
+    /* exposure — must be <= frame period; at 1000 fps that is <= 1000 us */
+    exposure_factor = "1000000";
+    min_exp_time = "1";              /* us */
+    max_exp_time = "1000";          /* us (1 ms at 1000 fps) */
+    step_exp_time = "1";
+    default_exp_time = "500";
+
+    /* framerate — value = fps * framerate_factor */
+    framerate_factor = "1000000";
+    min_framerate = "1000000";       /* 1 fps */
+    max_framerate = "1000000000";    /* 1000 fps  <-- raises the 42 fps ceiling */
+    step_framerate = "1";
+    default_framerate = "1000000000";
+
+    embedded_metadata_height = "0";
+};
