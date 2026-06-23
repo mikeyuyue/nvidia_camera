@@ -33,16 +33,20 @@ from .base import CameraBackend
 class V4l2Backend(CameraBackend):
     name = "v4l2"
 
-    #: VC MIPI / standard V4L2 control names. Confirm with --list-ctrls-menus.
+    #: Control names confirmed from `v4l2-ctl --list-ctrls-menus` on this rig
+    #: (Tegra/Argus V4L2 interface + VC MIPI controls).
     CONTROL_NAMES = {
-        "exposure": "exposure",          # often "exposure" (us) on VC MIPI
-        "gain": "gain",                  # analog gain
-        "trigger_mode": "trigger_mode",  # VC MIPI custom control
-        "flash": "flash_output",         # VC MIPI flash/strobe enable
+        "exposure": "exposure",          # int64, microseconds (default 10000)
+        "gain": "gain",                  # int64, 0..48001 step 100 (~milli-dB)
+        "fps": "frame_rate",             # int64; sets target rate (mode-capped)
+        "trigger_mode": "trigger_mode",  # int 0..7 (VC MIPI)
+        "flash": "io_mode",              # int 0..5 (GPIO/flash routing)
+        "binning": "binning_mode",       # int 0..7
+        "software_trigger": "single_trigger",  # button: write 1 to fire
     }
 
-    #: trigger_mode integer encoding. Confirm against the VC "Trigger and Flash"
-    #: application note for your sensor revision.
+    #: VC MIPI trigger_mode encoding (0..7). Confirm against the VC "Trigger and
+    #: Flash" application note; typical: 0=off/free-run, 1=external, 4=single.
     TRIGGER_VALUES = {
         TriggerMode.FREERUN: 0,
         TriggerMode.EXTERNAL: 1,
@@ -123,9 +127,10 @@ class V4l2Backend(CameraBackend):
 
     def set_fps(self, fps: float) -> None:
         self.config.fps = float(fps)
-        # Frame interval via v4l2-ctl. The achievable rate is ultimately bounded
-        # by the device-tree mode table / sensor blanking, not by this call.
-        self._run_v4l2ctl([f"--set-parm={fps:g}"])
+        # This Tegra interface ignores --set-parm; rate is set via the
+        # 'frame_rate' control. The achievable rate is still capped by the
+        # device-tree mode table (currently only the full-res mode exists).
+        self._set_ctrl(self.CONTROL_NAMES["fps"], int(round(fps)))
 
     def set_roi(self, x: int, y: int, width: int, height: int) -> None:
         self.config.roi.x, self.config.roi.y = x, y
@@ -140,11 +145,11 @@ class V4l2Backend(CameraBackend):
 
     def set_binning(self, factor: int) -> None:
         self.config.binning = int(factor)
-        # Binning mode is selected in the device tree / via a driver control;
-        # exact mechanism is module-specific. Re-apply format to pick up the
-        # new effective size.
-        self.set_roi(self.config.roi.x, self.config.roi.y,
-                     self.config.roi.width, self.config.roi.height)
+        # 'binning_mode' is a runtime VC MIPI control (0..7). We map the UI's
+        # 1x/2x to indices 0/1 — confirm the index→factor mapping for your
+        # module's mode table.
+        index = 0 if factor <= 1 else 1
+        self._set_ctrl(self.CONTROL_NAMES["binning"], index)
 
     def set_trigger_mode(self, mode: TriggerMode) -> None:
         self.config.trigger = mode
@@ -153,12 +158,15 @@ class V4l2Backend(CameraBackend):
 
     def set_flash(self, enabled: bool) -> None:
         self.config.flash_enable = bool(enabled)
+        # Flash/strobe is routed via 'io_mode' (0..5). The exact index that
+        # gates the strobe to exposure is module-specific; 1 is the usual
+        # "flash out" — confirm against the VC Trigger & Flash app note.
         self._set_ctrl(self.CONTROL_NAMES["flash"], 1 if enabled else 0)
 
     def software_trigger(self) -> None:
-        # If the driver exposes a software-trigger control, pulse it here.
-        # Otherwise a single external pulse / register write is needed.
-        self._set_ctrl("trigger_software", 1)
+        # 'single_trigger' is a write-only button control: writing 1 fires one
+        # frame (use with trigger_mode = SOFTWARE/single).
+        self._set_ctrl(self.CONTROL_NAMES["software_trigger"], 1)
 
     # --- helpers -----------------------------------------------------------
     def _effective_size(self) -> tuple[int, int]:

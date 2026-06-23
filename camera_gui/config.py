@@ -52,7 +52,8 @@ class AppConfig:
 
     backend: str = "mock"          # "mock" | "v4l2"
     device: str = "/dev/video0"    # v4l2 device node (the "cam0" path)
-    pixel_format: str = "GREY"     # v4l2 fourcc; e.g. GREY (8-bit) / Y10 / RG10
+    pixel_format: str = "RG10"     # v4l2 fourcc; IMX568 reports RG10 (10-bit
+                                   # "Bayer", treated as raw mono)
     display_fps: int = 30          # decimated preview rate; capture runs full rate
     ring_size: int = 256           # frames kept in the in-memory ring buffer
     record_dir: str = "recordings"
