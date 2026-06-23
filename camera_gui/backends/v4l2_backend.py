@@ -125,12 +125,18 @@ class V4l2Backend(CameraBackend):
         # Most drivers take an integer gain register value; round.
         self._set_ctrl(self.CONTROL_NAMES["gain"], int(round(gain)))
 
+    #: The 'frame_rate' control is expressed in fps x this factor. Confirmed on
+    #: this rig: control max 42050 == 42.05 fps. The driver also CLAMPS to the
+    #: mode's max_framerate, so until the device tree is reflashed you can't
+    #: request more than ~42 fps regardless of ROI.
+    FRAME_RATE_FACTOR = 1000
+
     def set_fps(self, fps: float) -> None:
         self.config.fps = float(fps)
-        # This Tegra interface ignores --set-parm; rate is set via the
-        # 'frame_rate' control. The achievable rate is still capped by the
-        # device-tree mode table (currently only the full-res mode exists).
-        self._set_ctrl(self.CONTROL_NAMES["fps"], int(round(fps)))
+        # Rate is set via the 'frame_rate' control (this Tegra interface ignores
+        # --set-parm). Value = fps * FRAME_RATE_FACTOR.
+        self._set_ctrl(self.CONTROL_NAMES["fps"],
+                       int(round(fps * self.FRAME_RATE_FACTOR)))
 
     def set_roi(self, x: int, y: int, width: int, height: int) -> None:
         self.config.roi.x, self.config.roi.y = x, y
