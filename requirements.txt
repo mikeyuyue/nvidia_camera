@@ -1,7 +1,9 @@
 # GUI
 PySide6>=6.5
 pyqtgraph>=0.13
-numpy>=1.21
+# Pin <2: JetPack's system matplotlib/OpenCV are built against NumPy 1.x, and
+# pyqtgraph's ImageView imports matplotlib — NumPy 2.x crashes that import.
+numpy>=1.21,<2
 
 # Optional, used by the v4l2 backend frame grabber and mp4 preview export.
 # On the Jetson, prefer the system OpenCV that ships with JetPack:
