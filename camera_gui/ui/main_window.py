@@ -157,9 +157,10 @@ class MainWindow(QMainWindow):
         if frame is not None and frame.index != self._last_index:
             self._last_index = frame.index
             # transpose so row-major (H, W) shows upright with row-major order on.
+            # imageAxisOrder is "row-major", so (H, W) displays upright as-is.
             self.view.setImage(
-                frame.data.T,
-                autoRange=False,
+                frame.data,
+                autoRange=not self._levels_set,
                 autoLevels=not self._levels_set,
                 autoHistogramRange=not self._levels_set,
             )
