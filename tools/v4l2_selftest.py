@@ -13,6 +13,9 @@ import os
 import select
 import sys
 
+# Allow running as `python tools/v4l2_selftest.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from camera_gui.backends import v4l2_capture as v
 
 
