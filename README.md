@@ -22,12 +22,18 @@ try Record, the trigger modes (free-run / external / software), ROI, etc.
 
 ```bash
 git pull                       # deploy
-sudo apt-get install python3-opencv v4l-utils   # system OpenCV + v4l2-ctl
-pip install PySide6 pyqtgraph                    # GUI deps
-python -m camera_gui --backend v4l2 --device /dev/video0 --pixel-format GREY
+# system deps: OpenCV + v4l2-ctl, and libxcb-cursor0 (Qt6/PySide6 xcb plugin)
+sudo apt-get install -y python3-opencv v4l-utils libxcb-cursor0 libxcb-xinerama0
+python3 -m venv --system-site-packages .venv    # so the venv sees system cv2
+source .venv/bin/activate
+pip install -r requirements.txt                 # PySide6, pyqtgraph, numpy<2
+python -m camera_gui --backend v4l2 --device /dev/video0 --pixel-format RG10
 ```
 
-CLI options: `--backend {mock,v4l2}`, `--device`, `--pixel-format` (GREY/Y10/…),
+Run it on the Jetson's own desktop (it's a GUI; needs a display / `$DISPLAY`),
+not a plain SSH session.
+
+CLI options: `--backend {mock,v4l2}`, `--device`, `--pixel-format` (RG10/Y10/…),
 `--display-fps`, `--ring-size`, `--record-dir`.
 
 ## Architecture
