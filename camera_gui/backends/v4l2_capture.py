@@ -64,7 +64,12 @@ class v4l2_pix_format(ctypes.Structure):
 
 
 class _fmt_union(ctypes.Union):
-    _fields_ = [("pix", v4l2_pix_format), ("raw", _u8 * 204)]
+    # The kernel's fmt union is 8-byte aligned (some members hold pointers), so
+    # there are 4 padding bytes after `type` and the payload is raw_data[200].
+    # The c_uint64 member forces ctypes to give the union 8-byte alignment too —
+    # without it `type` had no trailing pad and every pix field was 4 bytes off
+    # (the kernel read width from our height, etc.).
+    _fields_ = [("pix", v4l2_pix_format), ("raw", _u8 * 200), ("_align", ctypes.c_uint64)]
 
 
 class v4l2_format(ctypes.Structure):
