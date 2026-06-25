@@ -43,6 +43,18 @@ def main(argv=None) -> int:
     from .ui import MainWindow
 
     app = QApplication(sys.argv[:1])
+
+    # Qt's event loop runs in C and swallows SIGINT, so Ctrl+C normally won't
+    # stop the app. Restore the default handler so Ctrl+C terminates it, and run
+    # a no-op timer periodically to give Python a chance to process the signal.
+    import signal
+    from PySide6.QtCore import QTimer
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    _sigint_timer = QTimer()
+    _sigint_timer.start(200)
+    _sigint_timer.timeout.connect(lambda: None)
+
     backend = create_backend(cfg)
     win = MainWindow(cfg, backend)
     win.show()
