@@ -54,27 +54,27 @@ class V4l2Backend(CameraBackend):
     }
 
     def __init__(self, config: CameraConfig, device: str = "/dev/video0",
-                 pixel_format: str = "GREY"):
+                 pixel_format: str = "RG10"):
         super().__init__(config)
         self.device = device
         self.pixel_format = pixel_format
-        self._cap = None
+        self._cap = None     # V4l2MmapCapture
         self._v4l2ctl = shutil.which("v4l2-ctl")
 
     # --- lifecycle ---------------------------------------------------------
     def open(self) -> None:
-        import cv2  # imported lazily; only needed on hardware
+        # Frames are grabbed via a direct V4L2 mmap loop (OpenCV can't decode
+        # RG10). Camera controls still go through v4l2-ctl.
+        from .v4l2_capture import V4l2MmapCapture
 
+        self._cap = V4l2MmapCapture(self.device)
+        self._cap.open()
+
+        # Set the format on both the device (v4l2-ctl, so control ranges like
+        # frame_rate are recomputed for the ROI) and our capture fd.
         self._apply_format()
-        self._cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"could not open {self.device} via V4L2")
-        # Ask OpenCV not to convert to RGB so we keep raw mono frames.
-        try:
-            self._cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-        except Exception:
-            pass
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        w, h = self._effective_size()
+        self._cap.set_format(w, h, self.pixel_format)
 
         # Push the initial control state to the sensor.
         self.set_exposure(self.config.exposure_us)
@@ -84,36 +84,23 @@ class V4l2Backend(CameraBackend):
 
     def close(self) -> None:
         if self._cap is not None:
-            self._cap.release()
+            self._cap.close()
             self._cap = None
 
     def start_streaming(self) -> None:
-        # OpenCV streams implicitly on read(); nothing to do.
-        pass
+        if self._cap is not None:
+            self._cap.start()
 
     def stop_streaming(self) -> None:
-        pass
+        if self._cap is not None:
+            self._cap.stop()
 
     # --- frames ------------------------------------------------------------
     def grab(self, timeout: float = 1.0) -> Optional[np.ndarray]:
-        """Return the next frame as a 2-D ndarray, or None on timeout.
-
-        NOTE: ``VideoCapture.read()`` blocks without honouring ``timeout``. For
-        the 1000 fps target, replace this with a direct V4L2 mmap loop
-        (VIDIOC_QBUF/DQBUF with select() on the fd) so you get true timeouts and
-        zero-copy buffers. The OpenCV path here is correct but adds a copy and a
-        little latency.
-        """
+        """Return the next frame as a 2-D ndarray, or None on timeout."""
         if self._cap is None:
             return None
-        ok, frame = self._cap.read()
-        if not ok or frame is None:
-            return None
-        if frame.ndim == 3:
-            # OpenCV gave us BGR despite CONVERT_RGB=0 (some builds ignore it);
-            # collapse to mono.
-            frame = frame[..., 0]
-        return frame
+        return self._cap.grab(timeout)
 
     # --- controls ----------------------------------------------------------
     def set_exposure(self, exposure_us: int) -> None:
@@ -141,13 +128,7 @@ class V4l2Backend(CameraBackend):
     def set_roi(self, x: int, y: int, width: int, height: int) -> None:
         self.config.roi.x, self.config.roi.y = x, y
         self.config.roi.width, self.config.roi.height = width, height
-        # ROI changes the capture format and must happen while stopped.
-        was_open = self._cap is not None
-        if was_open:
-            self.close()
-        self._apply_format()
-        if was_open:
-            self.open()
+        self._reapply_format()
 
     def set_binning(self, factor: int) -> None:
         self.config.binning = int(factor)
@@ -156,6 +137,23 @@ class V4l2Backend(CameraBackend):
         # module's mode table.
         index = 0 if factor <= 1 else 1
         self._set_ctrl(self.CONTROL_NAMES["binning"], index)
+        self._reapply_format()
+
+    def _reapply_format(self) -> None:
+        """Re-set the capture format (device + our fd), pausing the stream if
+        it's running. The caller may already have stopped it (the UI pauses
+        capture around format changes); this is safe either way."""
+        if self._cap is None:
+            self._apply_format()
+            return
+        was_streaming = self._cap.streaming
+        if was_streaming:
+            self._cap.stop()
+        self._apply_format()
+        w, h = self._effective_size()
+        self._cap.set_format(w, h, self.pixel_format)
+        if was_streaming:
+            self._cap.start()
 
     def set_trigger_mode(self, mode: TriggerMode) -> None:
         self.config.trigger = mode
@@ -176,8 +174,10 @@ class V4l2Backend(CameraBackend):
 
     # --- helpers -----------------------------------------------------------
     def _effective_size(self) -> tuple[int, int]:
-        b = max(self.config.binning, 1)
-        return (self.config.roi.width // b, self.config.roi.height // b)
+        # Request the ROI size as-is. Binning is applied via the 'binning_mode'
+        # control, and set_format() reads back the geometry the driver actually
+        # provides, so the grabber stays correct regardless.
+        return (self.config.roi.width, self.config.roi.height)
 
     def _apply_format(self) -> None:
         w, h = self._effective_size()
