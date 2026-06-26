@@ -1,0 +1,67 @@
+<svg viewBox="0 0 780 470" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#1F3A5F"/>
+    </marker>
+    <marker id="arW" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#E08A1E"/>
+    </marker>
+  </defs>
+
+  <text x="390" y="40" text-anchor="middle" font-size="26" font-weight="700" fill="#1F3A5F">Ring Buffer — fixed-size circular store</text>
+
+  <!-- ring slots: cx=390 cy=255 R=128 r=40, labels old(n-7)..new(n) clockwise from top -->
+  <!-- i0 top (oldest / next overwritten) -->
+  <circle cx="390" cy="127" r="40" fill="#EFF3F6" stroke="#E08A1E" stroke-width="4" stroke-dasharray="7 5"/>
+  <text x="390" y="133" text-anchor="middle" font-size="16" font-weight="700" fill="#7A8794">n−7</text>
+  <!-- i1 -->
+  <circle cx="480.5" cy="164.5" r="40" fill="#CDE7E3" stroke="#2A9D8F" stroke-width="2"/>
+  <text x="480.5" y="170" text-anchor="middle" font-size="16" fill="#1F3A5F">n−6</text>
+  <!-- i2 right -->
+  <circle cx="518" cy="255" r="40" fill="#AEDBD4" stroke="#2A9D8F" stroke-width="2"/>
+  <text x="518" y="261" text-anchor="middle" font-size="16" fill="#1F3A5F">n−5</text>
+  <!-- i3 -->
+  <circle cx="480.5" cy="345.5" r="40" fill="#8ECEC4" stroke="#2A9D8F" stroke-width="2"/>
+  <text x="480.5" y="351" text-anchor="middle" font-size="16" fill="#13463F">n−4</text>
+  <!-- i4 bottom -->
+  <circle cx="390" cy="383" r="40" fill="#6FC0B4" stroke="#2A9D8F" stroke-width="2"/>
+  <text x="390" y="389" text-anchor="middle" font-size="16" fill="#0E3832">n−3</text>
+  <!-- i5 -->
+  <circle cx="299.5" cy="345.5" r="40" fill="#52B2A4" stroke="#2A9D8F" stroke-width="2"/>
+  <text x="299.5" y="351" text-anchor="middle" font-size="16" fill="#ffffff">n−2</text>
+  <!-- i6 left -->
+  <circle cx="262" cy="255" r="40" fill="#37A595" stroke="#2A9D8F" stroke-width="2"/>
+  <text x="262" y="261" text-anchor="middle" font-size="16" fill="#ffffff">n−1</text>
+  <!-- i7 top-left (newest) -->
+  <circle cx="299.5" cy="164.5" r="40" fill="#1F8C7E" stroke="#0E3832" stroke-width="3"/>
+  <text x="299.5" y="170" text-anchor="middle" font-size="17" font-weight="700" fill="#ffffff">n</text>
+
+  <!-- center -->
+  <text x="390" y="248" text-anchor="middle" font-size="16" font-weight="700" fill="#1F3A5F">N slots</text>
+  <text x="390" y="270" text-anchor="middle" font-size="14" fill="#7A8794">(fixed size)</text>
+
+  <!-- clockwise direction arc -->
+  <path d="M 360 95 A 150 150 0 0 1 425 95" fill="none" stroke="#1F3A5F" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="392" y="80" text-anchor="middle" font-size="12" fill="#1F3A5F">writes clockwise</text>
+
+  <!-- oldest annotation -->
+  <text x="390" y="-2" text-anchor="middle" font-size="13" fill="#E08A1E"> </text>
+  <line x1="455" y1="80" x2="412" y2="105" stroke="#E08A1E" stroke-width="2" marker-end="url(#arW)"/>
+  <text x="560" y="78" text-anchor="middle" font-size="13" font-weight="700" fill="#E08A1E">oldest →</text>
+  <text x="560" y="95" text-anchor="middle" font-size="12" fill="#E08A1E">overwritten next</text>
+
+  <!-- capture thread (left) -->
+  <rect x="20" y="225" width="150" height="60" rx="10" fill="#1F3A5F"/>
+  <text x="95" y="251" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">Capture thread</text>
+  <text x="95" y="271" text-anchor="middle" font-size="13" fill="#CADCEC">writes fast</text>
+  <line x1="170" y1="240" x2="232" y2="200" stroke="#1F3A5F" stroke-width="2.5" marker-end="url(#ar)"/>
+
+  <!-- display (right) -->
+  <rect x="610" y="225" width="150" height="60" rx="10" fill="#2A9D8F"/>
+  <text x="685" y="251" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">Display</text>
+  <text x="685" y="271" text-anchor="middle" font-size="13" fill="#E4F4F1">reads newest, 30 fps</text>
+  <line x1="610" y1="245" x2="335" y2="185" stroke="#2A9D8F" stroke-width="2.5" marker-end="url(#ar)"/>
+
+  <!-- caption -->
+  <text x="390" y="445" text-anchor="middle" font-size="14.5" fill="#1A1A2E">Fixed memory · newest overwrites oldest · fast writer and slow reader never block each other</text>
+</svg>

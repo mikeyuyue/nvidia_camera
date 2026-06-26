@@ -1,0 +1,60 @@
+<svg viewBox="0 0 860 440" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#1F3A5F"/>
+    </marker>
+    <marker id="ad" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#C8473B"/>
+    </marker>
+  </defs>
+
+  <text x="430" y="38" text-anchor="middle" font-size="25" font-weight="700" fill="#1F3A5F">Recording never stalls when the disk is slow</text>
+
+  <!-- Camera -->
+  <rect x="20" y="150" width="120" height="70" rx="10" fill="#1F3A5F"/>
+  <text x="80" y="180" text-anchor="middle" font-size="15" font-weight="700" fill="#fff">Camera</text>
+  <text x="80" y="201" text-anchor="middle" font-size="13" fill="#CADCEC">~400 fps</text>
+
+  <!-- Capture thread -->
+  <rect x="180" y="150" width="140" height="70" rx="10" fill="#2A9D8F"/>
+  <text x="250" y="180" text-anchor="middle" font-size="15" font-weight="700" fill="#fff">Capture thread</text>
+  <text x="250" y="201" text-anchor="middle" font-size="12.5" fill="#E4F4F1">submit() — never waits</text>
+
+  <line x1="140" y1="185" x2="178" y2="185" stroke="#1F3A5F" stroke-width="2.5" marker-end="url(#a)"/>
+
+  <!-- Bounded queue -->
+  <text x="500" y="120" text-anchor="middle" font-size="14" font-weight="700" fill="#1F3A5F">Bounded queue</text>
+  <g>
+    <rect x="400" y="150" width="34" height="70" rx="4" fill="#6FC0B4" stroke="#2A9D8F"/>
+    <rect x="436" y="150" width="34" height="70" rx="4" fill="#6FC0B4" stroke="#2A9D8F"/>
+    <rect x="472" y="150" width="34" height="70" rx="4" fill="#AEDBD4" stroke="#2A9D8F"/>
+    <rect x="508" y="150" width="34" height="70" rx="4" fill="#EFF3F6" stroke="#2A9D8F"/>
+    <rect x="544" y="150" width="34" height="70" rx="4" fill="#EFF3F6" stroke="#2A9D8F"/>
+  </g>
+  <line x1="320" y1="185" x2="398" y2="185" stroke="#1F3A5F" stroke-width="2.5" marker-end="url(#a)"/>
+
+  <!-- Writer thread -->
+  <rect x="630" y="150" width="130" height="70" rx="10" fill="#2A9D8F"/>
+  <text x="695" y="180" text-anchor="middle" font-size="15" font-weight="700" fill="#fff">Writer thread</text>
+  <text x="695" y="201" text-anchor="middle" font-size="12.5" fill="#E4F4F1">drains at disk speed</text>
+  <line x1="578" y1="185" x2="628" y2="185" stroke="#1F3A5F" stroke-width="2.5" marker-end="url(#a)"/>
+
+  <!-- Disk -->
+  <ellipse cx="815" cy="160" rx="30" ry="9" fill="#1F3A5F"/>
+  <path d="M785 160 v40 a30 9 0 0 0 60 0 v-40" fill="#1F3A5F"/>
+  <ellipse cx="815" cy="160" rx="30" ry="9" fill="#33507A"/>
+  <text x="815" y="225" text-anchor="middle" font-size="14" font-weight="700" fill="#1F3A5F">Disk</text>
+  <line x1="760" y1="185" x2="784" y2="185" stroke="#1F3A5F" stroke-width="2.5" marker-end="url(#a)"/>
+
+  <!-- overflow drop path -->
+  <line x1="489" y1="220" x2="489" y2="285" stroke="#C8473B" stroke-width="2.5" stroke-dasharray="6 4" marker-end="url(#ad)"/>
+  <rect x="392" y="288" width="200" height="58" rx="10" fill="#FBE9E7" stroke="#C8473B" stroke-width="2"/>
+  <text x="492" y="312" text-anchor="middle" font-size="14" font-weight="700" fill="#C8473B">queue full? DROP frame</text>
+  <text x="492" y="332" text-anchor="middle" font-size="13" fill="#C8473B">(count it — capture keeps going)</text>
+
+  <!-- speed labels -->
+  <text x="500" y="245" text-anchor="middle" font-size="12.5" fill="#7A8794">fills fast ──────────── empties at disk speed</text>
+
+  <!-- caption -->
+  <text x="430" y="405" text-anchor="middle" font-size="14.5" fill="#1A1A2E">Capture and disk run on separate threads — a slow disk drops frames, it never freezes the camera or the live view</text>
+</svg>
