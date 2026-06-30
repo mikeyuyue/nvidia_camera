@@ -5,9 +5,6 @@ on an **NVIDIA Jetson Orin Nano**, captured via V4L2. Provides a live decimated
 preview, full-rate recording, and camera controls including ROI/binning,
 trigger modes and the flash/strobe output.
 
-Develop and test it on a laptop with the built-in **mock** backend (synthetic
-frames), then deploy to the Jetson over git and switch to the **v4l2** backend.
-
 ## Quick start (laptop, no hardware)
 
 ```bash
@@ -15,8 +12,6 @@ pip install -r requirements.txt
 python -m camera_gui --backend mock
 ```
 
-A window opens with a moving synthetic pattern. Click **Start streaming**, then
-try Record, the trigger modes (free-run / external / software), ROI, etc.
 
 ## On the Jetson
 
@@ -24,14 +19,13 @@ try Record, the trigger modes (free-run / external / software), ROI, etc.
 git pull                       # deploy
 # system deps: OpenCV + v4l2-ctl, and libxcb-cursor0 (Qt6/PySide6 xcb plugin)
 sudo apt-get install -y python3-opencv v4l-utils libxcb-cursor0 libxcb-xinerama0
-python3 -m venv --system-site-packages .venv    # so the venv sees system cv2
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-pip install -r requirements.txt                 # PySide6, pyqtgraph, numpy<2
+pip install -r requirements.txt
 python -m camera_gui --backend v4l2 --device /dev/video0 --pixel-format RG10
 ```
 
-Run it on the Jetson's own desktop (it's a GUI; needs a display / `$DISPLAY`),
-not a plain SSH session.
+Run it on the Jetson's own desktop, not SSH.
 
 CLI options: `--backend {mock,v4l2}`, `--device`, `--pixel-format` (RG10/Y10/…),
 `--display-fps`, `--ring-size`, `--record-dir`.
@@ -71,7 +65,8 @@ specific module before the controls do the right thing. See the docstring in
    (exposure, gain, trigger_mode, flash) with the exact IDs your driver exposes.
 2. Confirm the `trigger_mode` integer encoding against the VC **"Trigger and
    Flash"** application note → `TRIGGER_VALUES`.
-3. For real 1000 fps, replace the OpenCV `read()` in `grab()` with a direct V4L2
+3. Currently the camera can reach around 770 fps. For higher fps, consider changing the device tree, 
+   replacing the OpenCV `read()` in `grab()` with a direct V4L2
    mmap loop (`VIDIOC_QBUF`/`DQBUF` + `select()`), and raise the frame rate via
    the **device-tree mode table** (lane count, PLL/clock, VMAX/HMAX blanking) —
    that ceiling lives in the driver, not in this app.

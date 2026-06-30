@@ -50,12 +50,72 @@ def main():
         return
 
     import pyqtgraph as pg
-    from pyqtgraph.Qt import QtWidgets
+    from pyqtgraph.Qt import QtCore, QtWidgets
 
+    n = frames.shape[0]
     pg.setConfigOptions(imageAxisOrder="row-major")
     app = QtWidgets.QApplication([])
-    iv = pg.image(frames, title=os.path.basename(args.path))   # time slider + levels
+
+    win = QtWidgets.QWidget()
+    win.setWindowTitle(os.path.basename(args.path))
+    win.resize(900, 640)
+    vbox = QtWidgets.QVBoxLayout(win)
+
+    iv = pg.ImageView()
+    iv.setImage(frames, autoLevels=True)     # drag the histogram sliders for contrast
     iv.setPredefinedGradient("grey")
+    vbox.addWidget(iv, 1)
+
+    # --- playback bar ---
+    bar = QtWidgets.QHBoxLayout()
+    play_btn = QtWidgets.QPushButton("▶  Play")
+    play_btn.setCheckable(True)
+    fps_spin = QtWidgets.QDoubleSpinBox()
+    fps_spin.setRange(0.1, 240.0)
+    fps_spin.setValue(args.fps)
+    fps_spin.setSuffix(" fps")
+    loop_chk = QtWidgets.QCheckBox("Loop")
+    loop_chk.setChecked(True)
+    frame_lbl = QtWidgets.QLabel()
+    for w in (play_btn, QtWidgets.QLabel("Speed:"), fps_spin, loop_chk):
+        bar.addWidget(w)
+    bar.addStretch(1)
+    bar.addWidget(frame_lbl)
+    vbox.addLayout(bar)
+
+    timer = QtCore.QTimer()
+
+    def advance():
+        i = iv.currentIndex + 1
+        if i >= n:
+            if loop_chk.isChecked():
+                i = 0
+            else:
+                play_btn.setChecked(False)
+                return
+        iv.setCurrentIndex(i)
+
+    def toggle(on):
+        play_btn.setText("⏸  Pause" if on else "▶  Play")
+        if on:
+            timer.start(int(1000 / max(fps_spin.value(), 0.1)))
+        else:
+            timer.stop()
+
+    def on_fps(v):
+        if timer.isActive():
+            timer.setInterval(int(1000 / max(v, 0.1)))
+
+    def on_time(ind, _t):
+        frame_lbl.setText(f"frame {int(ind) + 1} / {n}")
+
+    timer.timeout.connect(advance)
+    play_btn.toggled.connect(toggle)
+    fps_spin.valueChanged.connect(on_fps)
+    iv.sigTimeChanged.connect(on_time)
+    on_time(0, 0)
+
+    win.show()
     app.exec()
 
 
