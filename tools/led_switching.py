@@ -502,6 +502,18 @@ def cmd_sweep(a) -> str:
         master_dark = off
         sat = float(np.percentile(on[roi.mask], 99.9))
         print(f"[roi] DC-on 99.9th pct in LED = {sat:.0f} counts")
+        # Clipped pixels flatten the roll-off (they stay at full scale while the
+        # true level drops). Drop any pixel near full scale with the LED held on,
+        # which is the brightest state it will ever see.
+        clipped = roi.mask & (on >= a.sat_level)
+        if clipped.any():
+            frac = clipped.sum() / roi.mask.sum()
+            roi.mask = roi.mask & ~clipped
+            roi.n_led = int(roi.mask.sum())
+            print(f"[roi] excluded {clipped.sum()} pixels ({frac:.1%}) at >= {a.sat_level} "
+                  f"counts with the LED on; {roi.n_led} left. Lower --exposure-us if this is large.")
+            if roi.n_led < 50:
+                sys.exit("almost every LED pixel saturates: lower the exposure or gain")
         x, y, w, h = roi.bbox
         pad = a.crop_margin
         ys, xs = slice(max(0, y - pad), y + h + pad), slice(max(0, x - pad), x + w + pad)
@@ -542,7 +554,8 @@ def cmd_sweep(a) -> str:
                              sem=s / math.sqrt(len(corr)),
                              signal_per_duty=m / (d_act / 100.0),
                              step_dark=dark_sig, n_periods=n_per,
-                             roi_max=int(fr[:, roi.mask].max())))
+                             roi_max=int(fr[:, roi.mask].max()),
+                             n_clipped=int((fr[:, roi.mask] >= a.sat_level).any(0).sum())))
             crops[f"f{len(rows):03d}"] = bin_image(fr.astype(np.float32).mean(0)[ys, xs]
                                                   - master_dark[ys, xs], a.bin)
             print(f"  {fmt_hz(f_act):>11}  duty {d_act:6.3f}%  grey {m:9.2f} +- "
@@ -771,6 +784,9 @@ def main(argv=None):
                     help="frames dropped after every change (stale buffers)")
     sw.add_argument("--settle-s", type=float, default=0.05)
     sw.add_argument("--min-periods", type=float, default=50)
+    sw.add_argument("--sat-level", type=float, default=60000,
+                    help="pixels at or above this with the LED held on are left out "
+                         "(frames are 16-bit scaled on this rig: full scale 65535)")
     sw.add_argument("--dark-each-step", action="store_true",
                     help="also take LED-off frames after every step (Arduino only)")
     sw.add_argument("--hw-crop", action="store_true",
