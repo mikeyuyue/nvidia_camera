@@ -1,50 +1,87 @@
 // led_pwm_giga.ino - serial-controlled hardware PWM for the LED switching-speed
-// sweep, for the Arduino GIGA R1 WiFi (STM32H747, mbed core).
+// sweep, on the Arduino GIGA R1 (STM32H747, mbed core) driving the 24x24
+// matrix-addressed LED array (same wiring as sketch_nov25b/c):
+//   row pins    (rowMask) are anodes:   HIGH = row selected
+//   column pins (colMask) are cathodes: LOW  = column selected
+//   LED (r, c) is lit when row r is HIGH and column c is LOW.
 //
-// Same serial protocol as ../led_pwm/led_pwm.ino (115200 baud, one per line):
-//   F <hz> <duty_percent>   start PWM, e.g. "F 5000 50"
-//   ON | OFF | ?
-// Reply: OK <mode> <actual_hz> <actual_duty_percent>
+// For the sweep, the selected rows are held HIGH and one or more COLUMN pins are
+// driven by a hardware timer (column pins D3..D13 are PWM capable). Because
+// columns are active-low the PWM is inverted here: an LED duty of D means the
+// column pin is high for (1 - D) of each period. The duty in replies is the LED
+// (on) duty.
+//
+// Serial, 115200 baud, one command per line:
+//   F <hz> <duty_percent>   PWM the LEDs, e.g. "F 5000 50"
+//   ON                      selected LEDs held on (DC), for ROI detection
+//   OFF                     all LEDs off, for dark frames
+//   ?                       report state
+// Reply: OK <mode> <actual_hz> <actual_led_duty_percent>
 //
 // mbed's PwmOut sets the period in whole microseconds, so the actual frequency
-// is 1e6 / round(1e6 / f). Duty is set in timer ticks (fine at any period).
-// Frequencies above 500 kHz (period < 2 us) are refused.
+// is 1e6 / round(1e6 / f). Duty is set in timer ticks. Max 500 kHz (2 us).
 
 #include <Arduino.h>
 #include "mbed.h"
 
-#ifndef LED_PIN
-#define LED_PIN D9          // <-- set to the pin your LED driver is wired to (D2..D13)
-#endif
+const int rowMask[24] = {42, 41, 43, 40, 44, 39, 45, 38, 46, 37, 47, 36, 48, 35, 49, 34, 50, 33, 51, 32, 52, 31, 53, 30};
+const int colMask[24] = {14, 15, 13, 16, 12, 17, 11, 18, 10, 19, 9, 20, 8, 21, 7, 22, 6, 23, 5, 24, 4, 25, 3, 26};
 
-mbed::PwmOut pwm(digitalPinToPinName(LED_PIN));
+// ---- what to light --------------------------------------------------------
+// Columns driven by PWM: must be PWM-capable pins (D3..D13 here).
+const int PWM_COLS[] = {9};
+// Rows held HIGH: all 24 by default, i.e. one full column of 24 LEDs.
+const bool ALL_ROWS = true;
+const int ROWS[] = {46};          // used only when ALL_ROWS is false
+// ---------------------------------------------------------------------------
+
+const int NPWM = sizeof(PWM_COLS) / sizeof(PWM_COLS[0]);
+mbed::PwmOut *pwm[NPWM];
 float g_hz = 0, g_duty = 0;
 const char *g_mode = "OFF";
+
+bool isPwmCol(int pin) {
+  for (int i = 0; i < NPWM; i++) if (PWM_COLS[i] == pin) return true;
+  return false;
+}
+
+void setCols(float colHighFraction, int period_us) {
+  for (int i = 0; i < NPWM; i++) {
+    pwm[i]->period_us(period_us);
+    pwm[i]->write(colHighFraction);   // column HIGH = LED off
+  }
+}
 
 void report() {
   Serial.print("OK "); Serial.print(g_mode); Serial.print(' ');
   Serial.print(g_hz, 3); Serial.print(' '); Serial.println(g_duty, 4);
 }
 
-void hold(bool high) {
-  pwm.period_us(1000);
-  pwm.write(high ? 1.0f : 0.0f);
-  g_mode = high ? "ON" : "OFF"; g_hz = 0; g_duty = high ? 100 : 0;
+void hold(bool on) {
+  setCols(on ? 0.0f : 1.0f, 1000);
+  g_mode = on ? "ON" : "OFF"; g_hz = 0; g_duty = on ? 100 : 0;
 }
 
 bool startPwm(float hz, float duty) {
   if (hz <= 0 || duty <= 0 || duty >= 100) return false;
   long p = lroundf(1e6f / hz);
   if (p < 2 || p > 1000000) return false;
-  pwm.period_us((int)p);
-  pwm.write(duty / 100.0f);
+  setCols(1.0f - duty / 100.0f, (int)p);
   g_hz = 1e6f / p; g_duty = duty; g_mode = "PWM";
   return true;
 }
 
 void setup() {
-  Serial.begin(115200);
+  // every non-PWM column HIGH (off), every row LOW, then select the rows
+  for (int i = 0; i < 24; i++) {
+    if (!isPwmCol(colMask[i])) { pinMode(colMask[i], OUTPUT); digitalWrite(colMask[i], HIGH); }
+    pinMode(rowMask[i], OUTPUT); digitalWrite(rowMask[i], LOW);
+  }
+  for (int i = 0; i < NPWM; i++) pwm[i] = new mbed::PwmOut(digitalPinToPinName(PWM_COLS[i]));
   hold(false);
+  if (ALL_ROWS) { for (int i = 0; i < 24; i++) digitalWrite(rowMask[i], HIGH); }
+  else { for (unsigned i = 0; i < sizeof(ROWS) / sizeof(ROWS[0]); i++) digitalWrite(ROWS[i], HIGH); }
+  Serial.begin(115200);
   Serial.println("READY led_pwm_giga");
 }
 
