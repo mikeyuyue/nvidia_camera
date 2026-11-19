@@ -6,6 +6,8 @@ path with or without the .raw/.json suffix.
 
     python tools/view_raw.py D:\\nvidia_camera\\recordings\\recordings\\vc_20260626_165329
     python tools/view_raw.py <path> --mp4 out.mp4     # needs opencv installed
+    python tools/view_raw.py <path> --aa 0.8           # anti-alias low-pass (px)
+    python tools/view_raw.py <path> --mp4 out.mp4 --scale 2   # AA downscale 2x
 """
 import argparse
 import os
@@ -16,6 +18,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from camera_gui.core.recorder import load_raw
+from camera_gui.core.antialias import downscale, gaussian_blur
 
 
 def to_8bit(frames: np.ndarray) -> np.ndarray:
@@ -31,12 +34,24 @@ def main():
     ap.add_argument("path", help="recording base path (.raw/.json)")
     ap.add_argument("--mp4", metavar="OUT", help="export to MP4 instead of viewing")
     ap.add_argument("--fps", type=float, default=30.0, help="MP4 playback fps")
+    ap.add_argument("--aa", type=float, default=0.0, metavar="SIGMA",
+                    help="Gaussian anti-alias low-pass in px (0 = off)")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="shrink factor for export/view; blurs before resampling")
     args = ap.parse_args()
 
     frames = load_raw(args.path)        # (N, H, W)
     print(f"loaded {frames.shape[0]} frames {frames.shape[2]}x{frames.shape[1]} "
           f"dtype={frames.dtype} min={frames.min()} max={frames.max()} "
           f"mean={frames.mean():.1f}")
+
+    if args.aa > 0 or args.scale > 1:
+        # Low-pass BEFORE any resampling, otherwise periodic targets alias.
+        frames = np.stack([
+            downscale(gaussian_blur(f, args.aa), args.scale) for f in frames
+        ])
+        print(f"anti-aliased: sigma={args.aa} scale={args.scale} "
+              f"-> {frames.shape[2]}x{frames.shape[1]}")
 
     if args.mp4:
         import cv2

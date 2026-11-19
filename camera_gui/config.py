@@ -55,6 +55,7 @@ class AppConfig:
     pixel_format: str = "RG10"     # v4l2 fourcc; IMX568 reports RG10 (10-bit
                                    # "Bayer", treated as raw mono)
     display_fps: int = 30          # decimated preview rate; capture runs full rate
+    preview_aa_sigma: float = 0.0  # preview Gaussian low-pass (px); 0 = off
     ring_size: int = 256           # frames kept in the in-memory ring buffer
     record_dir: str = "recordings"
     camera: CameraConfig = field(default_factory=CameraConfig)

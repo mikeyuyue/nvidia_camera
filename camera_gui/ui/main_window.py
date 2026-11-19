@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from ..backends.base import CameraBackend
 from ..config import AppConfig, TriggerMode
 from ..core import CaptureThread, RingBuffer, Recorder
+from ..core.antialias import gaussian_blur
 from ..core.recorder import RecordFormat
 from .controls import ControlPanel
 
@@ -67,6 +68,11 @@ class MainWindow(QMainWindow):
         self.view = pg.ImageView()
         self.view.ui.roiBtn.hide()
         self.view.ui.menuBtn.hide()
+        # When the frame is larger than the widget, pyqtgraph would otherwise
+        # draw it nearest-neighbour, which aliases periodic targets (LED
+        # arrays) into moire. autoDownsample area-averages to screen size.
+        self.view.getImageItem().setAutoDownsample(True)
+        self._aa_sigma = float(self.cfg.preview_aa_sigma)
         layout.addWidget(self.view, stretch=1)
 
         self.controls = ControlPanel(self.cfg)
@@ -93,6 +99,7 @@ class MainWindow(QMainWindow):
         c.softwareTrigger.connect(self.backend.software_trigger)
         c.recordToggled.connect(self._set_recording)
         c.autoLevelsRequested.connect(self._auto_levels)
+        c.antialiasChanged.connect(self._set_aa_sigma)
 
     # --- control handlers --------------------------------------------------
     def _set_streaming(self, on: bool) -> None:
@@ -145,6 +152,10 @@ class MainWindow(QMainWindow):
                 f"({stats.bytes_written / 1e6:.1f} MB) to {stats.path}"
             )
 
+    def _set_aa_sigma(self, sigma: float) -> None:
+        self._aa_sigma = float(sigma)
+        self._last_index = -1          # redraw the current frame now
+
     def _auto_levels(self) -> None:
         frame = self.ring.latest()
         if frame is not None:
@@ -158,8 +169,12 @@ class MainWindow(QMainWindow):
             self._last_index = frame.index
             # transpose so row-major (H, W) shows upright with row-major order on.
             # imageAxisOrder is "row-major", so (H, W) displays upright as-is.
+            img = frame.data
+            if self._aa_sigma > 0:
+                # Preview-only low-pass; the ring buffer / RAW are untouched.
+                img = gaussian_blur(img, self._aa_sigma)
             self.view.setImage(
-                frame.data,
+                img,
                 autoRange=not self._levels_set,
                 autoLevels=not self._levels_set,
                 autoHistogramRange=not self._levels_set,

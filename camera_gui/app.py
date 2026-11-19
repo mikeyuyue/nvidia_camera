@@ -18,6 +18,8 @@ def build_config(argv=None) -> AppConfig:
                    help="v4l2 fourcc, e.g. GREY (8-bit), Y10, RG10")
     p.add_argument("--display-fps", type=int, default=30,
                    help="decimated preview rate; capture runs at full rate")
+    p.add_argument("--aa-sigma", type=float, default=0.0,
+                   help="preview anti-alias Gaussian sigma in px (0 = off)")
     p.add_argument("--ring-size", type=int, default=256,
                    help="frames kept in the in-memory ring buffer")
     p.add_argument("--record-dir", default="recordings")
@@ -28,6 +30,7 @@ def build_config(argv=None) -> AppConfig:
         device=args.device,
         pixel_format=args.pixel_format,
         display_fps=args.display_fps,
+        preview_aa_sigma=args.aa_sigma,
         ring_size=args.ring_size,
         record_dir=args.record_dir,
     )

@@ -38,6 +38,7 @@ class ControlPanel(QWidget):
     softwareTrigger = Signal()
     recordToggled = Signal(bool, object)       # (on, RecordFormat)
     autoLevelsRequested = Signal()
+    antialiasChanged = Signal(float)           # preview Gaussian sigma, px
 
     def __init__(self, cfg: AppConfig, parent=None):
         super().__init__(parent)
@@ -157,6 +158,24 @@ class ControlPanel(QWidget):
         self.btn_auto.clicked.connect(self.autoLevelsRequested)
         disp_row.addWidget(self.btn_auto)
         root.addLayout(disp_row)
+
+        # Anti-alias low-pass for the *preview only* (RAW stays lossless).
+        # 0 = off. ~0.7-1.0 px tames moire from periodic targets (LED arrays);
+        # the preview also area-averages when the image is shrunk to fit.
+        aa_form = QFormLayout()
+        self.sp_aa = QDoubleSpinBox()
+        self.sp_aa.setRange(0.0, 5.0)
+        self.sp_aa.setSingleStep(0.1)
+        self.sp_aa.setDecimals(1)
+        self.sp_aa.setSuffix(" px")
+        self.sp_aa.setValue(cfg.preview_aa_sigma)
+        self.sp_aa.setToolTip(
+            "Gaussian low-pass applied to the preview before display. "
+            "Removes moire added by display scaling. It cannot remove "
+            "aliasing already sampled by the sensor (fix that optically).")
+        self.sp_aa.valueChanged.connect(self.antialiasChanged)
+        aa_form.addRow("Anti-alias σ", self.sp_aa)
+        root.addLayout(aa_form)
 
         root.addStretch(1)
 
