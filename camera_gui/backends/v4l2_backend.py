@@ -76,9 +76,12 @@ class V4l2Backend(CameraBackend):
         w, h = self._effective_size()
         self._cap.set_format(w, h, self.pixel_format)
 
-        # Push the initial control state to the sensor.
+        # Push the initial control state to the sensor. set_fps matters: the
+        # driver's frame_rate control defaults to 0 (very low), so without this
+        # the sensor free-runs slowly until the user nudges Target FPS.
         self.set_exposure(self.config.exposure_us)
         self.set_gain(self.config.gain)
+        self.set_fps(self.config.fps)
         self.set_trigger_mode(self.config.trigger)
         self.set_flash(self.config.flash_enable)
 
