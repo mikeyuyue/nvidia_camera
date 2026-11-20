@@ -206,6 +206,201 @@ def detect_led_roi(on_mean: np.ndarray, off_mean: np.ndarray, *,
                   n_bg=int(bg.sum()), contrast=contrast)
 
 
+def _merge_lobes(lab: np.ndarray, keep: list) -> list:
+    if len(keep) < 2:
+        return [[k] for k in keep]
+    pts = {k: np.argwhere(lab == k)[:, ::-1].astype(float) for k in keep}   # (x, y)
+    cents = np.array([pts[k].mean(0) for k in keep])
+    axis = np.linalg.svd(cents - cents.mean(0), full_matrices=False)[2][0]
+    perp = np.array([-axis[1], axis[0]])
+    ext = {}
+    for k in keep:
+        t = pts[k] @ axis
+        u = pts[k] @ perp
+        ext[k] = (t.min(), t.max(), u.min(), u.max())
+    parent = {k: k for k in keep}
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+    for i, a in enumerate(keep):
+        for b in keep[i + 1:]:
+            ta0, ta1, ua0, ua1 = ext[a]
+            tb0, tb1, ub0, ub1 = ext[b]
+            ov = min(ta1, tb1) - max(ta0, tb0)
+            span = min(ta1 - ta0, tb1 - tb0) + 1
+            gap_u = max(ub0 - ua1, ua0 - ub1)
+            width = max(ua1 - ua0, ub1 - ub0) + 1
+            if ov > 0.5 * span and gap_u < 0.5 * width:
+                parent[find(b)] = find(a)
+    groups = {}
+    for k in keep:
+        groups.setdefault(find(k), []).append(k)
+    return list(groups.values())
+
+
+def segment_emitters(on_mean: np.ndarray, off_mean: np.ndarray, roi: "LedRoi", *,
+                      blur_sigma: float = 1.5, rel_thresh: float = 0.3,
+                      min_area: int = 15, close_px: int = 1, line_thresh: float = 0.4):
+    """Split the LED mask into individual emitters.
+
+    The on-off image is thresholded again inside the (dilated) LED mask, at
+    rel_thresh of each region's local peak, with only a tiny closing so that
+    neighbouring emitters stay apart. Components are numbered along the main
+    axis of the column (PCA of the centroids), so ID 0 is one end of the line.
+    Returns (labels int32 full-frame, 0 = none; list of dicts per emitter).
+    """
+    diff = on_mean.astype(np.float32) - off_mean.astype(np.float32)
+    proj = _segment_line(diff, roi, rel_thresh=line_thresh)
+    if proj is not None:
+        info = proj
+    else:
+        info = _segment_2d(diff, roi, blur_sigma, rel_thresh, min_area, close_px)
+    return _number_emitters(diff, info)
+
+
+def _segment_line(diff, roi, rel_thresh=0.25, min_len=4):
+    """LEDs along one line (a lit column/row): project the on-off image onto the
+    line's axis and cut it at the dark gaps between emitters. Much more robust
+    than 2D blobs when emitters sit a few px apart. None if the lit area is
+    not line-shaped."""
+    region = _dilate(roi.mask, 3)
+    ys, xs = np.nonzero(region)
+    if len(xs) < 50:
+        return None
+    pts = np.stack([xs, ys], 1).astype(float)
+    c0 = pts.mean(0)
+    u_, sv, vt = np.linalg.svd(pts - c0, full_matrices=False)
+    if sv[0] < 5 * sv[1]:                       # not elongated: use 2D blobs
+        return None
+    axis = vt[0]
+    if abs(axis[1]) >= abs(axis[0]):
+        axis = axis * np.sign(axis[1] or 1)
+    else:
+        axis = axis * np.sign(axis[0] or 1)
+    # The gaps between emitters follow the sensor grid, not the (slightly
+    # tilted) line, so project onto the nearest image axis when the line is
+    # within ~10 deg of it; otherwise onto the line itself.
+    if abs(axis[1]) > 0.985:
+        t = pts[:, 1]
+    elif abs(axis[0]) > 0.985:
+        t = pts[:, 0]
+    else:
+        t = (pts - c0) @ axis
+    ti = np.round(t - t.min()).astype(int)
+    w = np.maximum(diff[ys, xs], 0)
+    prof = np.bincount(ti, weights=w)
+    # threshold against a running local maximum so dim stretches still split
+    win = 41
+    pad = np.pad(prof, win // 2, mode="edge")
+    locmax = np.array([pad[i:i + win].max() for i in range(len(prof))])
+    on = prof > rel_thresh * np.maximum(locmax, 0.1 * prof.max())
+    on &= prof > 0.05 * prof.max()
+    segs, i = [], 0
+    while i < len(on):
+        if on[i]:
+            j = i
+            while j < len(on) and on[j]:
+                j += 1
+            if j - i >= min_len:
+                segs.append((i, j))
+            i = j
+        else:
+            i += 1
+    if len(segs) < 2:
+        return None
+    info = []
+    for a, b in segs:
+        sel = (ti >= a) & (ti < b)
+        pix = np.zeros(diff.shape, bool)
+        pix[ys[sel], xs[sel]] = True
+        pix &= roi.mask                          # drops clipped px
+        if pix.sum() < 3:
+            continue
+        yy, xx = np.nonzero(pix)
+        info.append(dict(cy=float(yy.mean()), cx=float(xx.mean()), area=int(pix.sum()),
+                         dc=float(diff[pix].mean()), pix=pix))
+    return info
+
+
+def _segment_2d(diff, roi, blur_sigma, rel_thresh, min_area, close_px):
+    sm = _blur(diff, blur_sigma) if blur_sigma > 0 else diff
+    region = _dilate(roi.mask, 3)
+    vals = sm[region]
+    peak = float(np.percentile(vals, 99.5))
+    base = float(np.median(sm[roi.bg])) if roi.bg.any() else 0.0
+    m = region & (sm > base + rel_thresh * (peak - base))
+    m = _close_open(m, close_px, 0)
+    lab, areas = _components(m)
+    keep = [i + 1 for i, a in enumerate(areas) if a >= min_area]
+    # One emitter can image as two lobes (dark notch in the middle). Merge
+    # components that sit side by side across the line: their extents along
+    # the line's main axis overlap and they are close across it.
+    groups = _merge_lobes(lab, keep)
+    out = np.zeros(diff.shape, np.int32)
+    info = []
+    for ks in groups:
+        pix = np.isin(lab, ks) & roi.mask    # roi.mask already drops clipped px
+        if pix.sum() < max(3, min_area // 3):
+            continue
+        ys, xs = np.nonzero(pix)
+        info.append(dict(cy=float(ys.mean()), cx=float(xs.mean()), area=int(pix.sum()),
+                         dc=float(diff[pix].mean()), pix=pix))
+    return info
+
+
+def _number_emitters(diff, info):
+    out = np.zeros(diff.shape, np.int32)
+    if not info:
+        return out, []
+    c = np.array([[d["cx"], d["cy"]] for d in info])
+    if len(c) > 1:
+        cc = c - c.mean(0)
+        axis = np.linalg.svd(cc, full_matrices=False)[2][0]
+        if abs(axis[1]) >= abs(axis[0]):
+            axis = axis * np.sign(axis[1] or 1)   # top -> bottom
+        else:
+            axis = axis * np.sign(axis[0] or 1)   # left -> right
+        tpos = cc @ axis
+        order = np.argsort(tpos)
+        st = np.diff(tpos[order])
+        # pitch = typical neighbour spacing; IDs are grid slots along the line, so
+        # a dark/missing LED keeps its slot (IDs then follow the physical rows)
+        pitch = float(np.median(st)) if len(st) else 1.0
+        inc = np.maximum(1, np.round(st / max(pitch, 1e-6))).astype(int)
+        slots = np.concatenate([[0], np.cumsum(inc)])
+    else:
+        order, slots = [0], [0]
+    emitters = []
+    for lab_no, (i, slot) in enumerate(zip(order, slots)):
+        d = info[i]
+        out[d.pop("pix")] = lab_no + 1
+        d["id"] = int(slot)
+        d["label"] = lab_no + 1
+        emitters.append(d)
+    med = np.median([d["dc"] for d in emitters])
+    for d in emitters:
+        d["dc_rel"] = d["dc"] / med if med else float("nan")
+    return out, emitters
+
+
+def emitter_signals(frames: np.ndarray, labels: np.ndarray, n: int,
+                    roi: "LedRoi", master_dark: np.ndarray) -> np.ndarray:
+    """Per-frame dark-subtracted mean of every emitter -> (frames, n)."""
+    flat = labels.ravel()
+    sel = flat > 0
+    idx = flat[sel] - 1
+    cnt = np.bincount(idx, minlength=n).astype(np.float64)
+    out = np.empty((len(frames), n))
+    for i, fr in enumerate(frames):
+        d = fr.astype(np.float32) - master_dark
+        sums = np.bincount(idx, weights=d.ravel()[sel], minlength=n)
+        out[i] = sums / np.maximum(cnt, 1) - d[roi.bg].mean()
+    return out
+
+
 def save_roi_png(path: str, on_mean, off_mean, roi: LedRoi) -> None:
     try:
         import matplotlib
@@ -298,8 +493,8 @@ class ArduinoDriver(LedDriver):
     def col(self, pin: int) -> None:
         self._raw(f"C {int(pin)}")
 
-    def pulse(self, period_us: int, width_us: float) -> tuple[float, float]:
-        _, hz, d = self._cmd(f"P {int(period_us)} {width_us:.4f}")
+    def pulse(self, period_us: float, width_us: float) -> tuple[float, float]:
+        _, hz, d = self._cmd(f"P {period_us:.4f} {width_us:.4f}")
         return hz, d
 
     def close(self):
@@ -341,7 +536,7 @@ class SimRig(LedDriver):
     name = "sim"
 
     def __init__(self, t_r=2e-6, t_f=1e-6, exposure_us=20000, shape=(400, 600),
-                 peak=600.0, seed=0):
+                 peak=600.0, seed=0, n_leds=0):
         self.t_r, self.t_f = t_r, t_f
         self.exp = exposure_us * 1e-6
         self.rng = np.random.default_rng(seed)
@@ -353,6 +548,20 @@ class SimRig(LedDriver):
         self.fpn = self.rng.normal(0, 3, shape).astype(np.float32)
         self.shape = shape
         self.state = ("off", 0.0, 0.0)
+        # optional column of separate emitters with their own edge times:
+        # LED 3 dim, LED 8 twice as slow, positions 5 and 12 dead (not drawn)
+        self.leds = []
+        if n_leds:
+            sc = 1 + 0.08 * self.rng.standard_normal(n_leds)
+            sc[8 % n_leds] = 2.0
+            for i in range(n_leds):
+                if i in (5, 12):
+                    continue
+                cy, cx = 30 + 18 * i, int(0.62 * w)
+                b = ((abs(yy - cy) <= 6) & (abs(xx - cx) <= 9)).astype(np.float32)
+                b = _blur(b, 1.0) * peak * (0.5 if i == 3 else 1.0)
+                self.leds.append((b, float(sc[i])))
+            self.true_scale = [s_ for _, s_ in self.leds]
 
     # driver side
     def on(self):
@@ -378,7 +587,7 @@ class SimRig(LedDriver):
     def pulse(self, period_us, width_us):
         return self.set_pwm(1e6 / period_us, 100.0 * width_us / period_us)
 
-    def _avg_level(self) -> float:
+    def _avg_level(self, scale: float = 1.0, ph: Optional[float] = None) -> float:
         mode, f, d = self.state
         if mode == "on":
             return 1.0
@@ -387,11 +596,12 @@ class SimRig(LedDriver):
         T = 1.0 / f
         ton = d / 100.0 * T
         extra = self.load_s_per_row * (self.n_rows - 1)
-        tr, tf = min(self.t_r + extra, ton / 2), min(self.t_f + extra / 2, ton / 2)
+        tr = min(scale * self.t_r + extra, ton / 2)
+        tf = min(scale * self.t_f + extra / 2, ton / 2)
         per_period = ton - tr / 2 - tf / 2           # area of the trapezoid
         n_full, rem = divmod(self.exp, T)
         # partial period at a random phase: integrate numerically
-        ph = self.rng.uniform(0, T)
+        ph = self.rng.uniform(0, T) if ph is None else ph * T
         t = (ph + np.linspace(0, rem, 200, endpoint=False)) % T
         wave = np.clip(np.minimum(t / max(tr, 1e-12), (ton - t) / max(tf, 1e-12)), 0, 1)
         wave[t > ton] = 0
@@ -400,12 +610,17 @@ class SimRig(LedDriver):
 
     # camera side
     def grab(self, timeout=1.0):
-        lvl = self._avg_level()
         black = 64 + self.rng.normal(0, 2)                 # per-frame drift
         rows = self.rng.normal(0, 1.5, (self.shape[0], 1))  # row noise
-        img = black + rows + self.fpn + lvl * (self.blob + self.glint)
+        if self.leds:
+            ph = self.rng.uniform()
+            light = sum(self._avg_level(sc, ph) * b for b, sc in self.leds)
+            light = light + self._avg_level(1.0, ph) * self.glint
+        else:
+            light = self._avg_level() * (self.blob + self.glint)
+        img = black + rows + self.fpn + light
         img = img + self.rng.normal(0, 1.0, self.shape) + \
-            self.rng.normal(0, 1, self.shape) * np.sqrt(np.maximum(lvl * self.blob, 0) / 4)
+            self.rng.normal(0, 1, self.shape) * np.sqrt(np.maximum(light, 0) / 4)
         return np.clip(img, 0, 1023).astype(np.uint16)
 
     def set_exposure(self, us):
@@ -500,7 +715,7 @@ def cmd_sweep(a) -> str:
     freqs = parse_freqs(a.freqs)
     if a.backend == "sim":
         rig = SimRig(t_r=a.sim_tr_us * 1e-6, t_f=a.sim_tf_us * 1e-6,
-                     exposure_us=a.exposure_us, seed=a.seed)
+                     exposure_us=a.exposure_us, seed=a.seed, n_leds=a.sim_leds)
         driver = rig
     else:
         rig = None
@@ -553,6 +768,15 @@ def cmd_sweep(a) -> str:
         ys, xs = slice(max(0, y - pad), y + h + pad), slice(max(0, x - pad), x + w + pad)
         dc_ref = float(frame_signal(on[None], roi, master_dark)[0])   # LED held on
         crops = {}
+        labels, emitters = segment_emitters(on, off, roi) if a.per_led else (None, [])
+        n_em = len(emitters)
+        if n_em:
+            em_dc = emitter_signals(on[None], labels, n_em, roi, master_dark)[0]
+            for d, v in zip(emitters, em_dc):
+                d["dc_signal"] = float(v)
+            print(f"[roi] segmented {n_em} individual LEDs (IDs 0..{emitters[-1]['id']} "
+                  f"along the line; {emitters[-1]['id'] + 1 - n_em} slots dark)")
+        em_rows = []
 
         # --- frequency steps -------------------------------------------
         def steps():
@@ -590,6 +814,28 @@ def cmd_sweep(a) -> str:
                              step_dark=dark_sig, n_periods=n_per,
                              roi_max=int(fr[:, roi.mask].max()),
                              n_clipped=int((fr[:, roi.mask] >= a.sat_level).any(0).sum())))
+            if n_em:
+                es = emitter_signals(fr, labels, n_em, roi, master_dark)
+                # Frame-to-frame noise (PWM phase within the exposure, LED
+                # current ripple) is common to every LED in the column. Measure
+                # each LED relative to the whole column in the SAME frame, so its
+                # error bar only holds what differs between LEDs; the column's
+                # own uncertainty is shared by all of them.
+                n_f = len(es)
+                cm_ = float(sig.mean())
+                if n_f > 1 and cm_ > 10 * sig.std(ddof=1) / math.sqrt(n_f) and np.all(sig > 0.2 * cm_):
+                    ratio = es / sig[:, None]
+                    em_m = ratio.mean(0) * cm_
+                    em_s = (ratio.std(0, ddof=1) / math.sqrt(n_f) * abs(cm_)
+                            if n_f > 1 else np.zeros(n_em))
+                else:                                    # LED dark: plain means
+                    em_m = es.mean(0)
+                    em_s = es.std(0, ddof=1) / math.sqrt(n_f) if n_f > 1 else np.zeros(n_em)
+                em_raw = es.std(0, ddof=1) / math.sqrt(n_f) if n_f > 1 else np.zeros(n_em)
+                for i in range(n_em):
+                    em_rows.append(dict(freq_hz=f_act, duty_pct=d_act, id=emitters[i]["id"],
+                                        signal=float(em_m[i]), sem=float(em_s[i]),
+                                        sem_raw=float(em_raw[i])))
             crops[f"f{len(rows):03d}"] = bin_image(fr.astype(np.float32).mean(0)[ys, xs]
                                                   - master_dark[ys, xs], a.bin)
             print(f"  {fmt_hz(f_act):>11}  duty {d_act:6.3f}%  grey {m:9.2f} +- "
@@ -612,11 +858,19 @@ def cmd_sweep(a) -> str:
                 dark_frames=a.dark_frames, dc_on_signal=dc_ref,
                 roi=roi.to_json(), sensor_roi=sensor_roi, bin=a.bin,
                 sim=dict(t_r_us=a.sim_tr_us, t_f_us=a.sim_tf_us) if a.backend == "sim" else None)
+    meta["emitters"] = emitters
     with open(base + "_meta.json", "w") as fh:
         json.dump(meta, fh, indent=2)
+    extra = {"labels": labels} if n_em else {}
     np.savez_compressed(base + "_roi.npz", mask=roi.mask, bg=roi.bg,
-                        master_dark=master_dark, dc_on=on, **crops)
-    print(f"\nsaved {base}_sweep.csv / _meta.json / _roi.npz / _roi.png")
+                        master_dark=master_dark, dc_on=on, **extra, **crops)
+    if em_rows:
+        with open(base + "_emitters.csv", "w", newline="") as fh:
+            wr = csv.DictWriter(fh, fieldnames=list(em_rows[0].keys()))
+            wr.writeheader()
+            wr.writerows(em_rows)
+    print(f"\nsaved {base}_sweep.csv / _meta.json / _roi.npz / _roi.png"
+          + (" / _emitters.csv" if em_rows else ""))
     analyze(base, k=a.k, fit_max_drop=a.fit_max_drop, knee_drop=a.knee_drop)
     return base
 
@@ -727,7 +981,171 @@ def analyze(base: str, k: Optional[float] = None, fit_max_drop: float = 0.3,
     with open(base + "_result.json", "w") as fh:
         json.dump(res, fh, indent=2)
     plot(base, f, yn, sn, use, res, meta)
+    if os.path.exists(base + "_emitters.csv"):
+        res["per_led"] = analyze_emitters(base, meta, k, fit_max_drop, (f, yn))
     return res
+
+
+def fit_rolloff(f, y, s, fit_max_drop=0.3):
+    """Iterative weighted line fit of the low-f part.
+    -> L0, slope (fractional drop per Hz), slope_err, used-mask"""
+    L0 = float(np.max(y[: max(2, len(y) // 4)]))
+    use = np.ones_like(f, bool)
+    for _ in range(10):
+        new = (y / L0) >= 1.0 - fit_max_drop
+        if new.sum() < 2:
+            new = np.zeros_like(use)
+            new[: min(len(f), 2)] = True
+        a0, b0, cov, _ = wlinfit(f[new], y[new], s[new])
+        done = np.array_equal(new, use)
+        use, L0 = new, a0
+        if done:
+            break
+    slope = -b0 / a0
+    J = np.array([b0 / a0 ** 2, -1.0 / a0])
+    return a0, slope, float(math.sqrt(max(J @ cov @ J, 0))), use
+
+
+def analyze_emitters(base, meta, k, fit_max_drop, whole=None):
+    """Per-LED fit + defect flags + plot. Writes _per_led.csv / _per_led.png."""
+    with open(base + "_emitters.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    ids = sorted({int(r["id"]) for r in rows})
+    em = {d["id"]: d for d in meta.get("emitters", [])}
+    out = []
+    curves = {}
+    for i in ids:
+        rr = sorted((r for r in rows if int(r["id"]) == i), key=lambda r: float(r["freq_hz"]))
+        f = np.array([float(r["freq_hz"]) for r in rr])
+        d = np.array([float(r["duty_pct"]) for r in rr]) / 100
+        y = np.array([float(r["signal"]) for r in rr]) / d
+        s = np.maximum(np.array([float(r["sem"]) for r in rr]) / d, 1e-3 * max(abs(y).max(), 1))
+        info = em.get(i, {})
+        rec = dict(id=i, cx=info.get("cx", np.nan), cy=info.get("cy", np.nan),
+                   area_px=info.get("area", 0), dc_rel=info.get("dc_rel", np.nan))
+        try:
+            L0, slope, err, use = fit_rolloff(f, y, s, fit_max_drop)
+            rec.update(L0=L0, t_sw_us=slope / k * 1e6, t_sw_err_us=err / k * 1e6,
+                       fit_points=int(use.sum()))
+            curves[i] = (f, y / L0)
+        except (np.linalg.LinAlgError, ZeroDivisionError):
+            rec.update(L0=np.nan, t_sw_us=np.nan, t_sw_err_us=np.nan, fit_points=0)
+        out.append(rec)
+    t = np.array([r["t_sw_us"] for r in out])
+    ok = np.isfinite(t)
+    med = float(np.median(t[ok])) if ok.any() else np.nan
+    mad = float(1.4826 * np.median(np.abs(t[ok] - med))) if ok.any() else np.nan
+    for r in out:
+        flags = []
+        if r["dc_rel"] < 0.7:
+            flags.append("dim")
+        if r["dc_rel"] > 1.3:
+            flags.append("bright")
+        if np.isfinite(r["t_sw_us"]) and mad > 0 and \
+                abs(r["t_sw_us"] - med) > max(4 * mad, 3 * r["t_sw_err_us"]):
+            flags.append("slow" if r["t_sw_us"] > med else "fast")
+        r["flags"] = "+".join(flags)
+    # missing emitters: gaps along the line much larger than the usual pitch
+    missing = []
+    for r0, r1 in zip(out[:-1], out[1:]):
+        if r1["id"] - r0["id"] > 1:
+            missing.append(dict(after_id=r0["id"], count=r1["id"] - r0["id"] - 1,
+                                ids=list(range(r0["id"] + 1, r1["id"]))))
+    n_missing = sum(m["count"] for m in missing)
+    with open(base + "_per_led.csv", "w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(out[0].keys()))
+        wr.writeheader()
+        wr.writerows(out)
+    print(f"\n=== per-LED ({len(out)} LEDs found, ~{n_missing} missing/dark in gaps) ===")
+    print(f"  t_r+t_f median {med:.3g} us, spread (robust sigma) {mad:.2g} us, "
+          f"range {np.nanmin(t):.3g} .. {np.nanmax(t):.3g} us")
+    for r in out:
+        if r["flags"]:
+            print(f"  LED {r['id']:3d}: {r['flags']:12s} t_r+t_f {r['t_sw_us']:.3g} us, "
+                  f"brightness {r['dc_rel']:.2f} x median")
+    for m in missing:
+        print(f"  LED slot(s) {m['ids']}: dark or missing")
+    plot_emitters(base, out, curves, med, missing, whole)
+    return dict(n=len(out), n_missing=n_missing, t_sw_median_us=med, t_sw_sigma_us=mad,
+                flagged=[r["id"] for r in out if r["flags"]], gaps=missing)
+
+
+def plot_emitters(base, out, curves, med, missing, whole):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib import cm, colors
+    except ImportError:
+        return
+    z = np.load(base + "_roi.npz")
+    img = z["dc_on"] - z["master_dark"]
+    t = np.array([r["t_sw_us"] for r in out])
+    ok = np.isfinite(t)
+    norm = colors.Normalize(np.nanpercentile(t, 2), np.nanpercentile(t, 98)) if ok.any() \
+        else colors.Normalize(0, 1)
+    cmap = cm.viridis
+    fig = plt.figure(figsize=(16, 6))
+    gs = fig.add_gridspec(1, 3, width_ratios=[0.9, 1.3, 1.5])
+    ax0 = fig.add_subplot(gs[0])
+    cx = np.array([r["cx"] for r in out])
+    cy = np.array([r["cy"] for r in out])
+    pad = 60
+    x0, x1 = max(0, int(cx.min()) - pad), min(img.shape[1], int(cx.max()) + pad)
+    y0, y1 = max(0, int(cy.min()) - pad), min(img.shape[0], int(cy.max()) + pad)
+    ax0.imshow(img[y0:y1, x0:x1], cmap="gray", vmax=np.percentile(img, 99.9),
+               extent=(x0, x1, y1, y0))
+    if "labels" in z:
+        lab = z["labels"][y0:y1, x0:x1]
+        ax0.contour(np.arange(x0, x1), np.arange(y0, y1), lab > 0, [0.5],
+                    colors="w", linewidths=0.4)
+    for r in out:
+        col = cmap(norm(r["t_sw_us"])) if np.isfinite(r["t_sw_us"]) else "r"
+        ax0.annotate(str(r["id"]), (r["cx"], r["cy"]), color=col, fontsize=7,
+                     ha="center", va="center", weight="bold",
+                     bbox=dict(boxstyle="round,pad=0.1", fc="k",
+                               ec="r" if r["flags"] else "none", alpha=0.6))
+    ax0.set_title("LED IDs (colour = t_r+t_f, red box = flagged)", fontsize=9)
+    ax1 = fig.add_subplot(gs[1])
+    id_list = [r["id"] for r in out]
+    for i, (f, yn) in curves.items():
+        ax1.plot(f, yn, "-", lw=0.8, alpha=0.7, color=cmap(norm(t[id_list.index(i)])))
+    if whole is not None:
+        ax1.plot(whole[0], whole[1], "k--", lw=1.5, label="whole column")
+        ax1.legend(fontsize=8)
+    ax1.set_xscale("log")
+    ax1.set_ylim(-0.05, 1.08)
+    ax1.set_xlabel("PWM frequency (Hz)")
+    ax1.set_ylabel("L / L0 (per duty), each LED")
+    ax1.set_title("roll-off of every LED", fontsize=9)
+    ax1.grid(alpha=0.3, which="both")
+    fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax1, label="t_r+t_f (µs)")
+    ax2 = fig.add_subplot(gs[2])
+    ax3 = ax2.twinx()
+    ax3.bar(id_list, [r["dc_rel"] for r in out], color="orange", alpha=0.25, width=0.8)
+    ax3.set_ylabel("steady-on brightness / median (bars)", color="darkorange")
+    ax3.set_ylim(0, 2.0)
+    ax2.errorbar(id_list, t, yerr=[r["t_sw_err_us"] for r in out], fmt="o", ms=4,
+                 capsize=2, color="#1f77b4", label="t_r+t_f")
+    fl = [r for r in out if r["flags"]]
+    if fl:
+        ax2.plot([r["id"] for r in fl], [r["t_sw_us"] for r in fl], "o", mfc="none",
+                 mec="r", ms=10, label="flagged")
+    ax2.axhline(med, color="gray", ls=":", lw=1)
+    for m in missing:
+        ax2.axvspan(m["after_id"] + 0.5, m["after_id"] + m["count"] + 0.5,
+                    color="r", alpha=0.15)
+    ax2.set_xlabel("LED ID along the line (red bands = dark/missing LEDs)")
+    ax2.set_ylabel("t_r + t_f (µs)")
+    ax2.set_zorder(ax3.get_zorder() + 1)
+    ax2.patch.set_visible(False)
+    ax2.legend(fontsize=8, loc="upper left")
+    ax2.set_title("per-LED switching time and brightness", fontsize=9)
+    ax2.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(base + "_per_led.png", dpi=120)
+    plt.close(fig)
+    print(f"  plot -> {base}_per_led.png")
 
 
 def plot(base, f, yn, sn, use, res, meta):
@@ -826,6 +1244,8 @@ def main(argv=None):
     sw.add_argument("--hw-crop", action="store_true",
                     help="crop the sensor ROI to the LED after detection")
     sw.add_argument("--crop-margin", type=int, default=48)
+    sw.add_argument("--no-per-led", dest="per_led", action="store_false",
+                    help="skip segmenting individual LEDs")
     sw.add_argument("--bin", type=int, default=1,
                     help="software bin factor for the saved per-step ROI crops")
     sw.add_argument("--close-px", type=int, default=7,
@@ -835,6 +1255,8 @@ def main(argv=None):
     sw.add_argument("--sim-tr-us", type=float, default=2.0)
     sw.add_argument("--sim-tf-us", type=float, default=1.0)
     sw.add_argument("--seed", type=int, default=0)
+    sw.add_argument("--sim-leds", type=int, default=0,
+                    help="sim: draw a column of this many separate LEDs")
     fit_args(sw)
 
     an = sub.add_parser("analyze", help="re-fit a saved sweep")
@@ -846,6 +1268,8 @@ def main(argv=None):
     st.add_argument("--duty", type=float, default=50.0)
     st.add_argument("--exposure-us", type=int, default=20000)
     st.add_argument("--seed", type=int, default=0)
+    st.add_argument("--leds", type=int, default=0,
+                    help="simulate a column of separate LEDs (per-LED test)")
 
     a = ap.parse_args(argv)
     if a.cmd == "analyze":
@@ -857,7 +1281,8 @@ def main(argv=None):
         freqs = "100,300,1k,3k,10k,20k,30k,50k,70k,100k,150k"
         args = ["sweep", "--backend", "sim", "--freqs", freqs, "--duty", str(a.duty),
                 "--exposure-us", str(a.exposure_us), "--sim-tr-us", str(t * 2 / 3),
-                "--sim-tf-us", str(t / 3), "--seed", str(a.seed), "--frames", "20"]
+                "--sim-tf-us", str(t / 3), "--seed", str(a.seed), "--frames", "20",
+                "--sim-leds", str(a.leds)]
         main(args)
 
 

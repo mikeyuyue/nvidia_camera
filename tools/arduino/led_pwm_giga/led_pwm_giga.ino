@@ -16,16 +16,22 @@
 //   ON                      selected LEDs held on (DC), for ROI detection
 //   OFF                     all LEDs off, for dark frames
 //   ?                       report state
-//   P <period_us> <width_us> pulse mode: LED on for width_us (sub-us ok, set in
-//                           timer ticks) every period_us (whole us)
+//   P <period_us> <width_us> pulse mode: LED on for width_us every period_us
+//                           (both fractional; one timer tick ~4 ns resolution)
+//   T                       timer debug info (clock, channel, PSC/ARR/CCR)
 //   R ALL | R <i,j,...>     rows held HIGH, by index 0..23 into rowMask
 //   C <pin>                 which column pin is PWM driven (D3..D13)
 // Reply: OK <mode> <actual_hz> <actual_led_duty_percent>   (F/ON/OFF/?/P)
 //        OK ROWS <n> | OK COL <pin>                       (R/C)
 // R and C keep the current mode. Defaults: all rows, column D9.
 //
-// mbed's PwmOut sets the period in whole microseconds, so the actual frequency
-// is 1e6 / round(1e6 / f). Duty is set in timer ticks. Max 500 kHz (2 us).
+// Timing: mbed's PwmOut keeps period AND pulse width in whole microseconds
+// (it rounds the pulse to 1 us, so e.g. 50% of a 5 us period came out as 40%,
+// which made odd-us periods read dim). Here mbed only picks the pin's timer and
+// channel; the period (PSC/ARR) and the compare value (CCR) are then written
+// straight into the STM32 timer registers, so any frequency is reachable and
+// duty/pulse width have one-timer-tick resolution (~4 ns at 240 MHz). Replies
+// carry the frequency and duty that the registers actually produce.
 
 #include <Arduino.h>
 #include "mbed.h"
@@ -38,15 +44,64 @@ int g_col = 9;                     // PWM-driven column pin (D3..D13)
 bool g_rows[24];                   // rows held HIGH
 // ---------------------------------------------------------------------------
 
-mbed::PwmOut *pwm = nullptr;
+// PwmOut keeps its pwmout_t (timer base + channel) protected; expose it.
+class RegPwm : public mbed::PwmOut {
+ public:
+  explicit RegPwm(PinName p) : mbed::PwmOut(p) {}
+  TIM_TypeDef *tim() { return (TIM_TypeDef *)_pwm.pwm; }
+  int channel() { return _pwm.channel; }
+};
+
+RegPwm *pwm = nullptr;
+double g_timclk = 0;               // timer input clock, Hz (measured at start)
 float g_hz = 0, g_duty = 0;
-int g_period = 1000;
 float g_colHigh = 1.0f;            // fraction of the period the column is HIGH (LED off)
 const char *g_mode = "OFF";
 
+volatile uint32_t *ccr() {
+  TIM_TypeDef *t = pwm->tim();
+  switch (pwm->channel()) {
+    case 1: return &t->CCR1;
+    case 2: return &t->CCR2;
+    case 3: return &t->CCR3;
+    default: return &t->CCR4;
+  }
+}
+
+// Let mbed set a known 1000 us period, then read back what it put in PSC/ARR.
+void measureTimerClock() {
+  pwm->period_us(1000);
+  pwm->write(0.5f);
+  TIM_TypeDef *t = pwm->tim();
+  g_timclk = (double)(t->PSC + 1) * (double)(t->ARR + 1) * 1000.0;
+}
+
+// Program period and column-high fraction directly. Returns the actual
+// frequency; *ledDuty gets the actual LED-on fraction (0..1).
+double setTimer(double hz, double colHigh, double *ledDuty) {
+  TIM_TypeDef *t = pwm->tim();
+  double total = g_timclk / hz;                       // ticks per period
+  uint32_t psc = (uint32_t)ceil(total / 65536.0);     // fits 16- and 32-bit timers
+  if (psc < 1) psc = 1;
+  uint32_t arr = (uint32_t)llround(total / psc);
+  if (arr < 2) arr = 2;
+  uint32_t c = (uint32_t)llround(colHigh * arr);
+  if (c > arr) c = arr;
+  t->CR1 &= ~TIM_CR1_CEN;
+  t->PSC = psc - 1;
+  t->ARR = arr - 1;
+  *ccr() = c;
+  t->CNT = 0;
+  t->EGR = TIM_EGR_UG;                                // load PSC/ARR/CCR now
+  t->CR1 |= TIM_CR1_CEN;
+  *ledDuty = 1.0 - (double)c / arr;
+  return g_timclk / ((double)psc * arr);
+}
+
 void apply() {
-  pwm->period_us(g_period);
-  pwm->write(g_colHigh);
+  double d;
+  double f = setTimer(g_hz > 0 ? g_hz : 1000.0, g_colHigh, &d);
+  if (g_hz > 0) { g_hz = f; g_duty = 100.0 * d; }
 }
 
 void report() {
@@ -55,23 +110,21 @@ void report() {
 }
 
 void hold(bool on) {
-  g_period = 1000; g_colHigh = on ? 0.0f : 1.0f; apply();
-  g_mode = on ? "ON" : "OFF"; g_hz = 0; g_duty = on ? 100 : 0;
+  g_hz = 0; g_colHigh = on ? 0.0f : 1.0f; apply();
+  g_mode = on ? "ON" : "OFF"; g_duty = on ? 100 : 0;
 }
 
 bool startPwm(float hz, float duty) {
-  if (hz <= 0 || duty <= 0 || duty >= 100) return false;
-  long p = lroundf(1e6f / hz);
-  if (p < 2 || p > 1000000) return false;
-  g_period = (int)p; g_colHigh = 1.0f - duty / 100.0f; apply();
-  g_hz = 1e6f / p; g_duty = duty; g_mode = "PWM";
+  if (hz <= 0 || hz > 20e6 || duty <= 0 || duty >= 100) return false;
+  g_hz = hz; g_colHigh = 1.0f - duty / 100.0f; apply();
+  g_mode = "PWM";
   return true;
 }
 
-bool startPulse(long period_us, float width_us) {
-  if (period_us < 2 || period_us > 1000000 || width_us <= 0 || width_us >= period_us) return false;
-  g_period = (int)period_us; g_colHigh = 1.0f - width_us / period_us; apply();
-  g_hz = 1e6f / period_us; g_duty = 100.0f * width_us / period_us; g_mode = "PULSE";
+bool startPulse(float period_us, float width_us) {
+  if (period_us < 0.05f || width_us <= 0 || width_us >= period_us) return false;
+  g_hz = 1e6f / period_us; g_colHigh = 1.0f - width_us / period_us; apply();
+  g_mode = "PULSE";
   return true;
 }
 
@@ -83,7 +136,8 @@ bool setCol(int pin) {
   if (pin < 3 || pin > 13) return false;
   if (pwm) { delete pwm; pwm = nullptr; pinMode(g_col, OUTPUT); digitalWrite(g_col, HIGH); }
   g_col = pin;
-  pwm = new mbed::PwmOut(digitalPinToPinName(g_col));
+  pwm = new RegPwm(digitalPinToPinName(g_col));
+  measureTimerClock();
   apply();
   return true;
 }
@@ -118,11 +172,18 @@ void loop() {
   if (line.equalsIgnoreCase("ON")) { hold(true); report(); }
   else if (line.equalsIgnoreCase("OFF")) { hold(false); report(); }
   else if (c == '?') report();
+  else if (c == 'T') {                    // timer info, for debugging
+    TIM_TypeDef *t = pwm->tim();
+    Serial.print("OK TIMER clk_hz="); Serial.print(g_timclk, 0);
+    Serial.print(" ch="); Serial.print(pwm->channel());
+    Serial.print(" psc="); Serial.print(t->PSC); Serial.print(" arr="); Serial.print(t->ARR);
+    Serial.print(" ccr="); Serial.println(*ccr());
+  }
   else if (c == 'F' || c == 'P') {
     int sp = a.indexOf(' ');
     float x = (sp > 0 ? a.substring(0, sp) : a).toFloat();
     float y = sp > 0 ? a.substring(sp + 1).toFloat() : 50;
-    bool ok = (c == 'F') ? startPwm(x, y) : startPulse(lroundf(x), y);
+    bool ok = (c == 'F') ? startPwm(x, y) : startPulse(x, y);
     if (ok) report(); else Serial.println("ERR bad arguments");
   }
   else if (c == 'R') {
