@@ -282,6 +282,26 @@ class ArduinoDriver(LedDriver):
         _, hz, d = self._cmd(f"F {f_hz:.6g} {duty:.6g}")
         return hz, d
 
+    # --- led_pwm_giga extras (row/column selection, sub-us pulses) ----------
+    def _raw(self, line: str) -> str:
+        self.ser.write((line + "\n").encode())
+        reply = self.ser.readline().decode(errors="replace").strip()
+        if not reply.startswith("OK"):
+            raise RuntimeError(f"Arduino said {reply!r} to {line!r} "
+                               "(is the latest led_pwm_giga sketch flashed?)")
+        return reply
+
+    def rows(self, idx) -> int:
+        arg = "ALL" if idx is None else ",".join(str(int(i)) for i in idx)
+        return int(self._raw(f"R {arg}").split()[-1])
+
+    def col(self, pin: int) -> None:
+        self._raw(f"C {int(pin)}")
+
+    def pulse(self, period_us: int, width_us: float) -> tuple[float, float]:
+        _, hz, d = self._cmd(f"P {int(period_us)} {width_us:.4f}")
+        return hz, d
+
     def close(self):
         try:
             self.off()
@@ -345,6 +365,19 @@ class SimRig(LedDriver):
         self.state = ("pwm", f_hz, duty)
         return f_hz, duty
 
+    load_s_per_row = 0.0             # extra edge time per lit row (selftest)
+    n_rows = 24
+
+    def rows(self, idx):
+        self.n_rows = 24 if idx is None else len(idx)
+        return self.n_rows
+
+    def col(self, pin):
+        pass
+
+    def pulse(self, period_us, width_us):
+        return self.set_pwm(1e6 / period_us, 100.0 * width_us / period_us)
+
     def _avg_level(self) -> float:
         mode, f, d = self.state
         if mode == "on":
@@ -353,7 +386,8 @@ class SimRig(LedDriver):
             return 0.0
         T = 1.0 / f
         ton = d / 100.0 * T
-        tr, tf = min(self.t_r, ton / 2), min(self.t_f, ton / 2)
+        extra = self.load_s_per_row * (self.n_rows - 1)
+        tr, tf = min(self.t_r + extra, ton / 2), min(self.t_f + extra / 2, ton / 2)
         per_period = ton - tr / 2 - tf / 2           # area of the trapezoid
         n_full, rem = divmod(self.exp, T)
         # partial period at a random phase: integrate numerically
