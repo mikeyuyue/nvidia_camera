@@ -201,6 +201,12 @@ def detect_led_roi(on_mean: np.ndarray, off_mean: np.ndarray, *,
     inner = _dilate(mask, bg_gap)
     outer = _dilate(mask, bg_gap + bg_width)
     bg = outer & ~inner & ~_dilate(lit, 2)
+    gap = bg_gap
+    while bg.sum() < 300 and gap < 300:          # glow ate the ring: move it out
+        gap += 25
+        bg = _dilate(mask, gap + bg_width) & ~_dilate(mask, gap) & ~_dilate(lit, 2)
+    if bg.sum() < 300:                           # last resort: ignore glow map
+        bg = _dilate(mask, bg_gap + 3 * bg_width) & ~_dilate(mask, bg_gap)
     contrast = float(diff[mask].mean() / max(sigma, 1e-6))
     return LedRoi(mask=mask, bg=bg, bbox=bbox, n_led=int(mask.sum()),
                   n_bg=int(bg.sum()), contrast=contrast)
@@ -982,7 +988,9 @@ def analyze(base: str, k: Optional[float] = None, fit_max_drop: float = 0.3,
         json.dump(res, fh, indent=2)
     plot(base, f, yn, sn, use, res, meta)
     if os.path.exists(base + "_emitters.csv"):
-        res["per_led"] = analyze_emitters(base, meta, k, fit_max_drop, (f, yn))
+        res["per_led"] = analyze_emitters(base, meta, k, fit_max_drop, (f, yn),
+                                          col=dict(f=f, y=y, use=use, t_sw_s=tsw,
+                                                   t_sw_err_s=tsw_err))
     return res
 
 
@@ -1006,8 +1014,15 @@ def fit_rolloff(f, y, s, fit_max_drop=0.3):
     return a0, slope, float(math.sqrt(max(J @ cov @ J, 0))), use
 
 
-def analyze_emitters(base, meta, k, fit_max_drop, whole=None):
-    """Per-LED fit + defect flags + plot. Writes _per_led.csv / _per_led.png."""
+def analyze_emitters(base, meta, k, fit_max_drop, whole=None, col=None):
+    """Per-LED fit + defect flags + plot. Writes _per_led.csv / _per_led.png.
+
+    With the column fit given (col), each LED is fitted RELATIVE to the column:
+    r_i(f) = y_i(f) / y_col(f) ~= r_i0 * [1 - k * dt_i * f] over the same
+    frequencies the column fit used, so t_i = t_col + dt_i. Frame-to-frame
+    noise common to the whole column (PWM phase inside the exposure, supply
+    ripple) cancels in r_i; the column's own error is shared by every LED and
+    is reported once, not folded into each LED's error bar."""
     with open(base + "_emitters.csv") as fh:
         rows = list(csv.DictReader(fh))
     ids = sorted({int(r["id"]) for r in rows})
@@ -1024,10 +1039,24 @@ def analyze_emitters(base, meta, k, fit_max_drop, whole=None):
         rec = dict(id=i, cx=info.get("cx", np.nan), cy=info.get("cy", np.nan),
                    area_px=info.get("area", 0), dc_rel=info.get("dc_rel", np.nan))
         try:
-            L0, slope, err, use = fit_rolloff(f, y, s, fit_max_drop)
-            rec.update(L0=L0, t_sw_us=slope / k * 1e6, t_sw_err_us=err / k * 1e6,
-                       fit_points=int(use.sum()))
-            curves[i] = (f, y / L0)
+            if col is not None and len(col["f"]) == len(f) and \
+                    np.allclose(col["f"], f, rtol=1e-6):
+                use = col["use"]
+                r = y / col["y"]
+                rs = np.maximum(s / np.abs(col["y"]), 1e-6)
+                a0, b0, cov, _ = wlinfit(f[use], r[use], rs[use])
+                dslope = -b0 / a0
+                J = np.array([b0 / a0 ** 2, -1.0 / a0])
+                derr = float(math.sqrt(max(J @ cov @ J, 0)))
+                t_i = col["t_sw_s"] + dslope / k
+                rec.update(L0=a0, t_sw_us=t_i * 1e6, t_sw_err_us=derr / k * 1e6,
+                           dt_vs_column_us=dslope / k * 1e6, fit_points=int(use.sum()))
+                curves[i] = (f, (r / a0) * whole[1] if whole is not None else r / a0)
+            else:
+                L0, slope, err, use = fit_rolloff(f, y, s, fit_max_drop)
+                rec.update(L0=L0, t_sw_us=slope / k * 1e6, t_sw_err_us=err / k * 1e6,
+                           fit_points=int(use.sum()))
+                curves[i] = (f, y / L0)
         except (np.linalg.LinAlgError, ZeroDivisionError):
             rec.update(L0=np.nan, t_sw_us=np.nan, t_sw_err_us=np.nan, fit_points=0)
         out.append(rec)
@@ -1059,6 +1088,9 @@ def analyze_emitters(base, meta, k, fit_max_drop, whole=None):
     print(f"\n=== per-LED ({len(out)} LEDs found, ~{n_missing} missing/dark in gaps) ===")
     print(f"  t_r+t_f median {med:.3g} us, spread (robust sigma) {mad:.2g} us, "
           f"range {np.nanmin(t):.3g} .. {np.nanmax(t):.3g} us")
+    if col is not None:
+        print(f"  (each LED fitted relative to the column; error bars are LED-to-LED only, "
+              f"the shared column error is +-{col['t_sw_err_s'] * 1e6:.2g} us)")
     for r in out:
         if r["flags"]:
             print(f"  LED {r['id']:3d}: {r['flags']:12s} t_r+t_f {r['t_sw_us']:.3g} us, "
@@ -1232,8 +1264,9 @@ def main(argv=None):
     sw.add_argument("--frames", type=int, default=30, help="frames per frequency")
     sw.add_argument("--dark-frames", type=int, default=20)
     sw.add_argument("--roi-frames", type=int, default=10)
-    sw.add_argument("--discard", type=int, default=3,
-                    help="frames dropped after every change (stale buffers)")
+    sw.add_argument("--discard", type=int, default=8,
+                    help="frames dropped after every change: the V4L2 queue still holds ~4 "
+                         "frames of the previous state (measured), keep a margin")
     sw.add_argument("--settle-s", type=float, default=0.05)
     sw.add_argument("--min-periods", type=float, default=50)
     sw.add_argument("--sat-level", type=float, default=60000,

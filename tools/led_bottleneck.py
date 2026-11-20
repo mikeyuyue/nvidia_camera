@@ -117,7 +117,8 @@ def main(argv=None):
     ap.add_argument("--duty", type=float, default=50)
     ap.add_argument("--frames", type=int, default=20)
     ap.add_argument("--roi-frames", type=int, default=8)
-    ap.add_argument("--discard", type=int, default=3)
+    ap.add_argument("--discard", type=int, default=8,
+                    help="frames dropped after each change (V4L2 queue lags ~4 frames)")
     ap.add_argument("--settle-s", type=float, default=0.05)
     ap.add_argument("--close-px", type=int, default=7)
     ap.add_argument("--sat-level", type=float, default=60000)
@@ -260,10 +261,14 @@ def verdict(res):
         if abs(m) < 2 * per_row_err or share < 0.2:
             lines.append("load-INDEPENDENT: not limited by line capacitance or by how much "
                          "current the column driver can sink. The limit is a fixed delay: "
-                         "the board transistor's switching delay (or the GIGA pin), or the LED.")
+                         "the board transistor's switching delay, or the LED itself.")
+        elif share < 0.6:
+            lines.append(f"MOSTLY a fixed delay ({b * 1e9:.0f} ns that does not depend on load: "
+                         "board transistor switching delay or the LED), plus a smaller "
+                         "load-dependent part (charging the column through the driver).")
         else:
             lines.append("load-DEPENDENT: more lit LEDs -> slower. The column driver "
-                         "(board transistor / its base drive from the GIGA pin) runs out of "
+                         "(board transistor / its drive from the GIGA pin) runs out of "
                          "current to charge the column, so it is the bottleneck, not the LED.")
     p = res.get("pulse")
     if p:
