@@ -53,6 +53,24 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 OUTDIR = os.path.join(REPO, "results", "led_switching")
 
+# IMX568 (VC MIPI driver): the "gain" control is in milli-dB (0..48001), so the
+# linear gain is 10**(gain/20000). Measured 2026-11-20: 3/6/9/12 dB gave
+# 1.419/1.993/2.807/3.968x (expected 1.413/1.995/2.818/3.981x), and the
+# dark-subtracted signal is linear in exposure (within ~1.5% from 100 us to
+# 1 ms, until pixels clip). Black-level pedestal is ~3866 counts (16-bit) at
+# 0 dB and shifts by tens of counts with gain, so the dark must be taken at the
+# same exposure AND gain. results/linearity_20261120_232833.
+
+
+def gain_linear(gain_mdb: float) -> float:
+    return 10.0 ** (float(gain_mdb) / 20000.0)
+
+
+def norm_factor(exposure_us: float, gain_mdb: float) -> float:
+    """Multiply a dark-subtracted grey level by this to get counts per us of
+    exposure at 0 dB gain, comparable across exposure/gain settings."""
+    return 1.0 / (float(exposure_us) * gain_linear(gain_mdb))
+
 
 # ============================================================================
 # helpers
@@ -727,6 +745,7 @@ def cmd_sweep(a) -> str:
         rig = None
         driver = ManualDriver() if a.manual else ArduinoDriver(a.port, a.baud)
     cam = Camera(a.backend, a.device, a.pixel_format, a.exposure_us, a.gain, sim=rig)
+    nf = norm_factor(a.exposure_us, a.gain)
     rows = []
     try:
         # --- ROI: LED held on vs off ------------------------------------
@@ -763,6 +782,11 @@ def cmd_sweep(a) -> str:
         clipped = roi.mask & (on >= a.sat_level)
         if clipped.any():
             frac = clipped.sum() / roi.mask.sum()
+            if frac > 0.01:
+                print(f"[roi] WARNING {frac:.1%} of LED pixels clip: the brightest parts of "
+                      f"each LED are lost and per-LED levels are compressed. Use a shorter "
+                      f"--exposure-us (about {int(a.exposure_us * a.sat_level / max(sat, 1) * 0.8)} us) "
+                      f"rather than relying on clip exclusion.")
             roi.mask = roi.mask & ~clipped
             roi.n_led = int(roi.mask.sum())
             print(f"[roi] excluded {clipped.sum()} pixels ({frac:.1%}) at >= {a.sat_level} "
@@ -815,6 +839,7 @@ def cmd_sweep(a) -> str:
             m, s = float(corr.mean()), float(corr.std(ddof=1)) if len(corr) > 1 else 0.0
             rows.append(dict(freq_hz=f_act, freq_req_hz=f_req, duty_pct=d_act,
                              n_frames=len(corr), signal=m, std=s,
+                             signal_norm=m * nf,
                              sem=s / math.sqrt(len(corr)),
                              signal_per_duty=m / (d_act / 100.0),
                              step_dark=dark_sig, n_periods=n_per,
@@ -841,6 +866,7 @@ def cmd_sweep(a) -> str:
                 for i in range(n_em):
                     em_rows.append(dict(freq_hz=f_act, duty_pct=d_act, id=emitters[i]["id"],
                                         signal=float(em_m[i]), sem=float(em_s[i]),
+                                        signal_norm=float(em_m[i]) * nf,
                                         sem_raw=float(em_raw[i])))
             crops[f"f{len(rows):03d}"] = bin_image(fr.astype(np.float32).mean(0)[ys, xs]
                                                   - master_dark[ys, xs], a.bin)
@@ -860,8 +886,11 @@ def cmd_sweep(a) -> str:
         wr.writeheader()
         wr.writerows(rows)
     meta = dict(stamp=stamp, driver=driver.name, duty_cmd_pct=a.duty,
-                exposure_us=a.exposure_us, gain=a.gain, frames=a.frames,
-                dark_frames=a.dark_frames, dc_on_signal=dc_ref,
+                exposure_us=a.exposure_us, gain=a.gain, gain_db=a.gain / 1000.0,
+                gain_linear=gain_linear(a.gain), norm_factor=nf,
+                signal_norm_units="dark-subtracted counts per us exposure at 0 dB",
+                frames=a.frames, dark_frames=a.dark_frames, dc_on_signal=dc_ref,
+                dc_on_signal_norm=dc_ref * nf,
                 roi=roi.to_json(), sensor_roi=sensor_roi, bin=a.bin,
                 sim=dict(t_r_us=a.sim_tr_us, t_f_us=a.sim_tf_us) if a.backend == "sim" else None)
     meta["emitters"] = emitters
@@ -1260,7 +1289,7 @@ def main(argv=None):
     sw.add_argument("--duty", type=float, default=50.0, help="duty cycle, percent")
     sw.add_argument("--exposure-us", type=int, default=20000,
                     help="must span many PWM periods at the lowest frequency")
-    sw.add_argument("--gain", type=float, default=0)
+    sw.add_argument("--gain", type=float, default=0, help="sensor gain in milli-dB (0..48001); keep fixed, outputs are also normalised to 0 dB")
     sw.add_argument("--frames", type=int, default=30, help="frames per frequency")
     sw.add_argument("--dark-frames", type=int, default=20)
     sw.add_argument("--roi-frames", type=int, default=10)
