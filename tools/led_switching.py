@@ -468,16 +468,16 @@ class LedDriver:
 
 
 class ArduinoDriver(LedDriver):
-    """Talks to tools/arduino/led_pwm/led_pwm.ino over USB serial."""
+    """Talks to tools/arduino/led_pwm_giga (or the Uno led_pwm) over USB serial."""
     name = "arduino"
 
-    def __init__(self, port: str, baud: int = 115200):
+    def __init__(self, port: str, baud: int = 115200, boot_wait: float = 2.0):
         try:
             import serial
         except ImportError:
             sys.exit("pyserial missing: pip install pyserial (or sudo apt install python3-serial)")
         self.ser = serial.Serial(port, baud, timeout=2.0)
-        time.sleep(2.0)                      # the board resets when the port opens
+        time.sleep(boot_wait)                # an Uno resets when the port opens (GIGA doesn't)
         self.ser.reset_input_buffer()
         self._cmd("?")                       # fails loudly if the sketch isn't there
 
@@ -511,7 +511,7 @@ class ArduinoDriver(LedDriver):
         return reply
 
     def rows(self, idx) -> int:
-        arg = "ALL" if idx is None else ",".join(str(int(i)) for i in idx)
+        arg = "ALL" if idx is None else (",".join(str(int(i)) for i in idx) or "NONE")
         return int(self._raw(f"R {arg}").split()[-1])
 
     def col(self, pin: int) -> None:
@@ -521,9 +521,54 @@ class ArduinoDriver(LedDriver):
         _, hz, d = self._cmd(f"P {period_us:.4f} {width_us:.4f}")
         return hz, d
 
-    def close(self):
+    def duty(self, duty: float) -> tuple[float, float]:
+        """Change duty, keep the frequency (PWM/PULSE mode)."""
+        _, hz, d = self._cmd(f"D {duty:.6g}")
+        return hz, d
+
+    def burst(self, n: int) -> tuple[float, float]:
+        """n periods at the current frequency/duty, then off. Blocks until done."""
+        old = self.ser.timeout
+        self.ser.timeout = max(old or 0, 2.0 + 1.5 * n / max(self._last_hz(), 1e-3))
         try:
-            self.off()
+            _, hz, d = self._cmd(f"B {int(n)}")
+        finally:
+            self.ser.timeout = old
+        return hz, d
+
+    def _last_hz(self) -> float:
+        return self.state().get("hz", 1.0) or 1.0
+
+    def dc_cols(self, idx) -> int:
+        """Extra columns held LOW (DC on), by matrix index; None = all, [] = none."""
+        arg = "ALL" if idx is None else (",".join(str(int(i)) for i in idx) or "NONE")
+        return int(self._raw(f"K {arg}").split()[-1])
+
+    def led(self, row: int, col: int) -> tuple[str, float, float]:
+        """Exactly one LED on (DC), matrix indices 0..23."""
+        return self._cmd(f"L {int(row)} {int(col)}")
+
+    def all_on(self) -> None:
+        self._cmd("A")
+
+    def state(self) -> dict:
+        """Parsed 'S' status: mode, hz, duty, pwm_col_pin, pwm_col_idx, rows, dc_cols."""
+        reply = self._raw("S")
+        out = {}
+        for tok in reply.split()[2:]:
+            k, _, v = tok.partition("=")
+            if k in ("rows", "dc_cols"):
+                out[k] = [] if v == "none" else [int(x) for x in v.split(",")]
+            elif k == "mode":
+                out[k] = v
+            else:
+                out[k] = float(v) if "." in v else int(v)
+        return out
+
+    def close(self, keep_state: bool = False):
+        try:
+            if not keep_state:
+                self.off()
         finally:
             self.ser.close()
 
@@ -744,6 +789,17 @@ def cmd_sweep(a) -> str:
     else:
         rig = None
         driver = ManualDriver() if a.manual else ArduinoDriver(a.port, a.baud)
+        if isinstance(driver, ArduinoDriver) and (a.rows or a.pwm_col or a.dc_cols):
+            # which LEDs take part (led_pwm_giga sketch): rows HIGH, the PWM
+            # column pin, and optional extra columns held on (DC)
+            from led_control import idx_list
+            if a.pwm_col:
+                driver.col(a.pwm_col)
+            if a.rows:
+                driver.rows(idx_list(a.rows))
+            if a.dc_cols:
+                driver.dc_cols(idx_list(a.dc_cols))
+            print(f"[led] {driver.state()}")
     cam = Camera(a.backend, a.device, a.pixel_format, a.exposure_us, a.gain, sim=rig)
     nf = norm_factor(a.exposure_us, a.gain)
     rows = []
@@ -1280,6 +1336,9 @@ def main(argv=None):
     sw.add_argument("--device", default="/dev/video0")
     sw.add_argument("--pixel-format", default="RG10")
     sw.add_argument("--port", default="/dev/ttyACM0", help="Arduino serial port")
+    sw.add_argument("--rows", help="GIGA: rows lit during the sweep (all | none | 0,3,5-8)")
+    sw.add_argument("--pwm-col", type=int, help="GIGA: PWM column pin, 3..13 (default D9)")
+    sw.add_argument("--dc-cols", help="GIGA: extra columns held on (DC) during the sweep")
     sw.add_argument("--baud", type=int, default=115200)
     sw.add_argument("--manual", action="store_true",
                     help="set each frequency by hand; the tool prompts and you can "

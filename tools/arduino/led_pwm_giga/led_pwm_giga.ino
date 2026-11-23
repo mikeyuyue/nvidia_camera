@@ -1,37 +1,47 @@
-// led_pwm_giga.ino - serial-controlled hardware PWM for the LED switching-speed
-// sweep, on the Arduino GIGA R1 (STM32H747, mbed core) driving the 24x24
-// matrix-addressed LED array (same wiring as sketch_nov25b/c):
+// led_pwm_giga.ino - serial-controlled hardware PWM for the 24x24 micro-LED
+// matrix, on the Arduino GIGA R1 (STM32H747, mbed core). Talk to it from Python
+// with pyserial (tools/led_control.py, tools/led_switching.py).
+// Wiring (same as sketch_nov25b/c):
 //   row pins    (rowMask) are anodes:   HIGH = row selected
 //   column pins (colMask) are cathodes: LOW  = column selected
 //   LED (r, c) is lit when row r is HIGH and column c is LOW.
 //
-// For the sweep, the selected rows are held HIGH and one or more COLUMN pins are
-// driven by a hardware timer (column pins D3..D13 are PWM capable). Because
-// columns are active-low the PWM is inverted here: an LED duty of D means the
-// column pin is high for (1 - D) of each period. The duty in replies is the LED
-// (on) duty.
+// The selected rows are held HIGH and one COLUMN pin (the "PWM column") is
+// driven by a hardware timer (column pins D3..D13 are PWM capable). Columns are
+// active-low, so the PWM is inverted here: an LED duty of D means the column
+// pin is high for (1 - D) of each period. Duties in replies are LED (on) duty.
 //
 // Serial, 115200 baud, one command per line:
 //   F <hz> <duty_percent>   PWM the LEDs, e.g. "F 5000 50"
-//   ON                      selected LEDs held on (DC), for ROI detection
-//   OFF                     all LEDs off, for dark frames
-//   ?                       report state
 //   P <period_us> <width_us> pulse mode: LED on for width_us every period_us
 //                           (both fractional; one timer tick ~4 ns resolution)
-//   T                       timer debug info (clock, channel, PSC/ARR/CCR)
-//   R ALL | R <i,j,...>     rows held HIGH, by index 0..23 into rowMask
+//   D <duty_percent>        change the duty, keep the frequency (PWM/PULSE mode)
+//   B <n>                   burst: n periods at the current frequency/duty from a
+//                           clean start, then OFF. The end is written at a period
+//                           boundary (compare preload), so the count is exact
+//                           unless a period is shorter than the ~2 us loop jitter.
+//   ON                      PWM column held on (DC)
+//   OFF                     PWM column off
+//   R ALL | R NONE | R <i,j,...>   rows held HIGH, by index 0..23 into rowMask
 //   C <pin>                 which column pin is PWM driven (D3..D13)
-// Reply: OK <mode> <actual_hz> <actual_led_duty_percent>   (F/ON/OFF/?/P)
-//        OK ROWS <n> | OK COL <pin>                       (R/C)
-// R and C keep the current mode. Defaults: all rows, column D9.
+//   K ALL | K NONE | K <i,j,...>   extra columns held LOW (DC on), by index
+//                           0..23 into colMask; the PWM column is not touched
+//   L <row> <col>           light exactly ONE LED, DC (matrix indices 0..23). If
+//                           its column pin is PWM capable it becomes the PWM
+//                           column, so F/D/P/B then modulate that single LED.
+//   A                       every LED on, DC (what led_all_on did)
+//   ?                       short state;  S  full status;  T  timer registers
+// Reply: OK <mode> <actual_hz> <actual_led_duty_percent>  (F/P/D/B/ON/OFF/?/L/A)
+//        OK ROWS <n> | OK COL <pin> | OK COLS <n> | OK STATUS ... | OK TIMER ...
+// R, C and K keep the current mode. Defaults at power-up: all rows HIGH, PWM
+// column D9 OFF, no extra columns.
 //
 // Timing: mbed's PwmOut keeps period AND pulse width in whole microseconds
-// (it rounds the pulse to 1 us, so e.g. 50% of a 5 us period came out as 40%,
-// which made odd-us periods read dim). Here mbed only picks the pin's timer and
-// channel; the period (PSC/ARR) and the compare value (CCR) are then written
-// straight into the STM32 timer registers, so any frequency is reachable and
-// duty/pulse width have one-timer-tick resolution (~4 ns at 240 MHz). Replies
-// carry the frequency and duty that the registers actually produce.
+// (it rounds the pulse to 1 us, so e.g. 50% of a 5 us period came out as 40%).
+// Here mbed only picks the pin's timer and channel; the period (PSC/ARR) and
+// the compare value (CCR) are written straight into the STM32 timer registers,
+// so any frequency is reachable and duty/pulse width have one-timer-tick
+// resolution (~4 ns at 240 MHz). Replies carry the values the registers produce.
 
 #include <Arduino.h>
 #include "mbed.h"
@@ -39,9 +49,10 @@
 const int rowMask[24] = {42, 41, 43, 40, 44, 39, 45, 38, 46, 37, 47, 36, 48, 35, 49, 34, 50, 33, 51, 32, 52, 31, 53, 30};
 const int colMask[24] = {14, 15, 13, 16, 12, 17, 11, 18, 10, 19, 9, 20, 8, 21, 7, 22, 6, 23, 5, 24, 4, 25, 3, 26};
 
-// ---- defaults --------------------------------------------------------------
+// ---- state -----------------------------------------------------------------
 int g_col = 9;                     // PWM-driven column pin (D3..D13)
 bool g_rows[24];                   // rows held HIGH
+bool g_dccols[24];                 // extra columns held LOW (DC on)
 // ---------------------------------------------------------------------------
 
 // PwmOut keeps its pwmout_t (timer base + channel) protected; expose it.
@@ -128,8 +139,45 @@ bool startPulse(float period_us, float width_us) {
   return true;
 }
 
+bool modulating() { return strcmp(g_mode, "PWM") == 0 || strcmp(g_mode, "PULSE") == 0; }
+
+bool setDuty(float duty) {
+  if (!modulating() || duty <= 0 || duty >= 100) return false;
+  const char *m = g_mode;
+  bool ok = startPwm(g_hz, duty);
+  g_mode = m;
+  return ok;
+}
+
+// n periods from CNT = 0, then the compare is set to "always off". CCR is
+// preloaded, so the new value takes effect at the next update event, i.e.
+// exactly at a period boundary.
+bool burst(long n) {
+  if (!modulating() || n < 1) return false;
+  double period_us = 1e6 / g_hz;
+  float hz = g_hz, duty = g_duty;
+  apply();                                           // restarts the counter at 0
+  unsigned long t0 = micros();
+  double wait = (n - 0.5) * period_us;               // land mid-way in the last period
+  while ((double)(micros() - t0) < wait) {}
+  TIM_TypeDef *t = pwm->tim();
+  *ccr() = t->ARR + 1;                               // column HIGH = LED off from next period
+  delayMicroseconds((unsigned)(2 * period_us) + 2);
+  hold(false);
+  g_mode = "BURST_DONE"; g_hz = hz; g_duty = duty;   // report what was sent
+  return true;
+}
+
 void applyRows() {
   for (int i = 0; i < 24; i++) digitalWrite(rowMask[i], g_rows[i] ? HIGH : LOW);
+}
+
+void applyCols() {
+  for (int i = 0; i < 24; i++) {
+    if (colMask[i] == g_col) continue;               // the timer owns this pin
+    pinMode(colMask[i], OUTPUT);
+    digitalWrite(colMask[i], g_dccols[i] ? LOW : HIGH);
+  }
 }
 
 bool setCol(int pin) {
@@ -139,13 +187,88 @@ bool setCol(int pin) {
   pwm = new RegPwm(digitalPinToPinName(g_col));
   measureTimerClock();
   apply();
+  applyCols();                                       // old PWM pin back to its DC state
   return true;
+}
+
+// "ALL" | "NONE" | "i,j,k" -> flags[24]
+void parseList(const String &a, bool *flags) {
+  bool all = a.equalsIgnoreCase("ALL");
+  for (int i = 0; i < 24; i++) flags[i] = all;
+  if (all || a.length() == 0 || a.equalsIgnoreCase("NONE")) return;
+  int start = 0;
+  while (start < (int)a.length()) {
+    int comma = a.indexOf(',', start);
+    if (comma < 0) comma = a.length();
+    String tok = a.substring(start, comma);
+    tok.trim();
+    if (tok.length() && isDigit(tok.charAt(0))) {
+      int idx = tok.toInt();
+      if (idx >= 0 && idx < 24) flags[idx] = true;
+    }
+    start = comma + 1;
+  }
+}
+
+int count24(const bool *f) { int n = 0; for (int i = 0; i < 24; i++) n += f[i]; return n; }
+
+bool lightOne(int r, int c) {
+  if (r < 0 || r > 23 || c < 0 || c > 23) return false;
+  for (int i = 0; i < 24; i++) { g_rows[i] = (i == r); g_dccols[i] = false; }
+  int pin = colMask[c];
+  if (pin >= 3 && pin <= 13) {                       // PWM capable: modulatable LED
+    if (pin != g_col) setCol(pin);
+    applyCols();
+    applyRows();
+    hold(true);
+  } else {                                           // DC only; PWM column stays off
+    hold(false);
+    g_dccols[c] = true;
+    applyCols();
+    applyRows();
+    g_mode = "ON"; g_duty = 100;
+  }
+  return true;
+}
+
+void allOn() {
+  for (int i = 0; i < 24; i++) { g_rows[i] = true; g_dccols[i] = true; }
+  applyCols();
+  applyRows();
+  hold(true);
+}
+
+void printList(const bool *f) {
+  int n = 0;
+  for (int i = 0; i < 24; i++) if (f[i]) { if (n++) Serial.print(','); Serial.print(i); }
+  if (!n) Serial.print("none");
+}
+
+void status() {
+  int ci = -1;
+  for (int i = 0; i < 24; i++) if (colMask[i] == g_col) ci = i;
+  Serial.print("OK STATUS mode="); Serial.print(g_mode);
+  Serial.print(" hz="); Serial.print(g_hz, 3);
+  Serial.print(" duty="); Serial.print(g_duty, 4);
+  Serial.print(" pwm_col_pin="); Serial.print(g_col);
+  Serial.print(" pwm_col_idx="); Serial.print(ci);
+  Serial.print(" rows="); printList(g_rows);
+  Serial.print(" dc_cols="); printList(g_dccols);
+  Serial.println();
 }
 
 String arg(const String &line) {
   int sp = line.indexOf(' ');
   if (sp < 0) return String("");
-  String r = line.substring(sp + 1); r.trim(); return r;
+  String r = line.substring(sp + 1);
+  r.trim();
+  return r;
+}
+
+void twoNums(const String &a, float *x, float *y, float ydef) {
+  int sp = a.indexOf(' ');
+  *x = (sp > 0 ? a.substring(0, sp) : a).toFloat();
+  *y = sp > 0 ? a.substring(sp + 1).toFloat() : ydef;
 }
 
 void setup() {
@@ -154,6 +277,7 @@ void setup() {
     pinMode(colMask[i], OUTPUT); digitalWrite(colMask[i], HIGH);
     pinMode(rowMask[i], OUTPUT); digitalWrite(rowMask[i], LOW);
     g_rows[i] = true;
+    g_dccols[i] = false;
   }
   setCol(g_col);
   hold(false);
@@ -167,44 +291,53 @@ void loop() {
   String line = Serial.readStringUntil('\n');
   line.trim();
   if (line.length() == 0) return;
-  char c = toupper(line.charAt(0));
+  String cmd = line;
+  int sp = line.indexOf(' ');
+  if (sp > 0) cmd = line.substring(0, sp);
+  cmd.toUpperCase();
   String a = arg(line);
-  if (line.equalsIgnoreCase("ON")) { hold(true); report(); }
-  else if (line.equalsIgnoreCase("OFF")) { hold(false); report(); }
-  else if (c == '?') report();
-  else if (c == 'T') {                    // timer info, for debugging
+  float x, y;
+  if (cmd == "ON") { hold(true); report(); }
+  else if (cmd == "OFF") { hold(false); report(); }
+  else if (cmd == "?") report();
+  else if (cmd == "S") status();
+  else if (cmd == "T") {                             // timer registers, for debugging
     TIM_TypeDef *t = pwm->tim();
     Serial.print("OK TIMER clk_hz="); Serial.print(g_timclk, 0);
     Serial.print(" ch="); Serial.print(pwm->channel());
     Serial.print(" psc="); Serial.print(t->PSC); Serial.print(" arr="); Serial.print(t->ARR);
     Serial.print(" ccr="); Serial.println(*ccr());
   }
-  else if (c == 'F' || c == 'P') {
-    int sp = a.indexOf(' ');
-    float x = (sp > 0 ? a.substring(0, sp) : a).toFloat();
-    float y = sp > 0 ? a.substring(sp + 1).toFloat() : 50;
-    bool ok = (c == 'F') ? startPwm(x, y) : startPulse(x, y);
-    if (ok) report(); else Serial.println("ERR bad arguments");
+  else if (cmd == "F") {
+    twoNums(a, &x, &y, 50);
+    if (startPwm(x, y)) report(); else Serial.println("ERR F <hz> <duty, 0<d<100>");
   }
-  else if (c == 'R') {
-    if (a.equalsIgnoreCase("ALL")) { for (int i = 0; i < 24; i++) g_rows[i] = true; }
-    else {
-      for (int i = 0; i < 24; i++) g_rows[i] = false;
-      int start = 0;
-      while (start < (int)a.length()) {
-        int comma = a.indexOf(',', start); if (comma < 0) comma = a.length();
-        int idx = a.substring(start, comma).toInt();
-        if (idx >= 0 && idx < 24) g_rows[idx] = true;
-        start = comma + 1;
-      }
-    }
-    applyRows();
-    int n = 0; for (int i = 0; i < 24; i++) n += g_rows[i];
-    Serial.print("OK ROWS "); Serial.println(n);
+  else if (cmd == "P") {
+    twoNums(a, &x, &y, 0);
+    if (startPulse(x, y)) report(); else Serial.println("ERR P <period_us> <width_us>");
   }
-  else if (c == 'C') {
+  else if (cmd == "D") {
+    if (setDuty(a.toFloat())) report(); else Serial.println("ERR D needs PWM mode and 0<duty<100");
+  }
+  else if (cmd == "B") {
+    if (burst(a.toInt())) report(); else Serial.println("ERR B <n> needs PWM mode");
+  }
+  else if (cmd == "R") {
+    parseList(a, g_rows); applyRows();
+    Serial.print("OK ROWS "); Serial.println(count24(g_rows));
+  }
+  else if (cmd == "K") {
+    parseList(a, g_dccols); applyCols();
+    Serial.print("OK COLS "); Serial.println(count24(g_dccols));
+  }
+  else if (cmd == "C") {
     if (setCol(a.toInt())) { Serial.print("OK COL "); Serial.println(g_col); }
     else Serial.println("ERR column pin must be 3..13");
   }
+  else if (cmd == "L") {
+    twoNums(a, &x, &y, -1);
+    if (lightOne((int)x, (int)y)) report(); else Serial.println("ERR L <row 0..23> <col 0..23>");
+  }
+  else if (cmd == "A" || cmd == "ALL") { allOn(); report(); }
   else Serial.println("ERR unknown command");
 }
