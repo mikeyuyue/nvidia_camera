@@ -30,6 +30,12 @@ Commands:
   python3 tools/led_switching.py sweep --manual --duty 50 --freqs 1k,10k,100k
   python3 tools/led_switching.py sweep --manual --duty 50          # type each f
   python3 tools/led_switching.py analyze results/led_switching/<stamp>
+  python3 tools/led_switching.py ledmap --pwm-col 9 --exposure-us 500  # each LED alone
+  python3 tools/led_switching.py sweep ... --led-map results/led_switching/<stamp>_D9_ledmap.npz
+
+Each LED images with a dark cross, i.e. as 2-4 bright lobes. 'ledmap' lights one
+address at a time, so all lobes of an LED are grouped as one LED (and dead or
+miswired addresses show up); 'sweep --led-map' then measures per LED with it.
   python3 tools/led_switching.py selftest --tsw-us 3                # simulated
 
 Outputs go to <repo>/results/led_switching/<stamp>_*.{csv,json,png,npz}.
@@ -408,6 +414,250 @@ def _number_emitters(diff, info):
     for d in emitters:
         d["dc_rel"] = d["dc"] / med if med else float("nan")
     return out, emitters
+
+
+# ----------------------------------------------------------------------------
+# Address-based LED map. Each LED images with a dark cross through its middle
+# (microscope photo, 2026-11-24), so one LED looks like 2 or 4 bright lobes and
+# any segmentation of the all-on image cuts it at the notch (24 LEDs -> 48).
+# Lighting one address at a time removes the ambiguity: everything that lights
+# up with address r belongs to LED r, however many lobes it has.
+# ----------------------------------------------------------------------------
+def _spots_one_address(diff, *, sigma_noise, blur_sigma=2.0, rel=0.12, close_px=8,
+                       merge_r=25.0, min_spot_rel=0.08, lobe_rel=0.6):
+    """Bright regions of one address's on-off image.
+    -> list of dicts (pix, cx, cy, flux, peak, lobes), brightest first.
+    Lobes of one LED are joined by a closing of close_px and by merging any
+    region whose centroid is within merge_r px of a brighter one."""
+    sm = _blur(diff, blur_sigma) if blur_sigma > 0 else diff
+    peak = float(sm.max())
+    thr = max(rel * peak, 6 * sigma_noise)
+    m = _close_open(sm > thr, close_px, 1)
+    lab, areas = _components(m)
+    regs = []
+    for k in range(1, len(areas) + 1):
+        pix = lab == k
+        w = np.maximum(diff[pix], 0)
+        flux = float(w.sum())
+        if flux <= 0:
+            continue
+        ys, xs = np.nonzero(pix)
+        regs.append(dict(pix=pix, flux=flux, cx=float((xs * w).sum() / flux),
+                         cy=float((ys * w).sum() / flux), peak=float(sm[pix].max())))
+    regs.sort(key=lambda r: -r["flux"])
+    spots = []
+    for r in regs:                                   # merge leftover lobes
+        host = next((s for s in spots if math.hypot(s["cx"] - r["cx"], s["cy"] - r["cy"]) < merge_r), None)
+        if host is None:
+            spots.append(r)
+            continue
+        f = host["flux"] + r["flux"]
+        host["cx"] = (host["cx"] * host["flux"] + r["cx"] * r["flux"]) / f
+        host["cy"] = (host["cy"] * host["flux"] + r["cy"] * r["flux"]) / f
+        host["flux"], host["pix"] = f, host["pix"] | r["pix"]
+        host["peak"] = max(host["peak"], r["peak"])
+    if not spots:
+        return []
+    spots = [s for s in spots if s["flux"] >= min_spot_rel * spots[0]["flux"]]
+    for s in spots:                                  # how many lobes inside
+        _, a = _components(s["pix"] & (diff > lobe_rel * float(diff[s["pix"]].max())))
+        s["lobes"] = int((a >= 4).sum())
+    return spots
+
+
+def build_led_map(diffs: dict, *, min_snr=30.0, min_rel=0.05, pitch=None,
+                  **spot_kw) -> tuple:
+    """diffs: {address: on-off image with only that address lit}.
+    -> (labels int32 full-frame 0 = none, emitters list, report dict).
+
+    One emitter per physical spot. A spot's id is its grid slot along the
+    line (fitted from the primary spots: slot = address for a good LED), and
+    'address' says which drive line lit it. So a LED wired to the wrong line
+    keeps its own slot and shows address != id."""
+    addrs = sorted(diffs)
+    any_d = diffs[addrs[0]]
+    sigma = 1.4826 * float(np.median(np.abs(any_d - np.median(any_d)))) + 1e-6
+    per = {}
+    peaks = {}
+    for a in addrs:
+        sp = _spots_one_address(diffs[a].astype(np.float32), sigma_noise=sigma, **spot_kw)
+        per[a] = sp
+        peaks[a] = sp[0]["peak"] if sp else 0.0
+    alive_pk = [p for p in peaks.values() if p > min_snr * sigma]
+    med_pk = float(np.median(alive_pk)) if alive_pk else 0.0
+    dead = [a for a in addrs if peaks[a] < max(min_snr * sigma, min_rel * med_pk)]
+    live = [a for a in addrs if a not in dead]
+    if not live:
+        raise RuntimeError("no address lit anything")
+    # grid along the line from primary spots: position t = t0 + pitch * address
+    c = np.array([[per[a][0]["cx"], per[a][0]["cy"]] for a in live])
+    axis = np.array([0.0, 1.0])
+    if len(live) > 1:
+        axis = np.linalg.svd(c - c.mean(0), full_matrices=False)[2][0]
+        if abs(axis[1]) >= abs(axis[0]):
+            axis = axis * np.sign(axis[1] or 1)
+        else:
+            axis = axis * np.sign(axis[0] or 1)
+    t = c @ axis
+    if len(live) >= 3:
+        A = np.stack([np.ones(len(live)), np.array(live, float)], 1)
+        coef = np.linalg.lstsq(A, t, rcond=None)[0]
+        for _ in range(2):                             # drop gross outliers (miswired)
+            res = t - A @ coef
+            ok = np.abs(res) < max(3 * 1.4826 * np.median(np.abs(res)), 0.25 * abs(coef[1]))
+            if ok.sum() >= 3:
+                coef = np.linalg.lstsq(A[ok], t[ok], rcond=None)[0]
+        t0, p_fit = float(coef[0]), float(coef[1])
+    else:
+        t0, p_fit = float(t[0]), float(pitch or 40.0)
+    if pitch:
+        p_fit = math.copysign(pitch, p_fit)
+    spots = []
+    for a in live:
+        for k, s in enumerate(per[a]):
+            slot = int(round((np.array([s["cx"], s["cy"]]) @ axis - t0) / p_fit))
+            spots.append(dict(s, address=a, primary=(k == 0), slot=slot))
+    # pixels claimed by several spots go to the one brightest there (relative)
+    shape = any_d.shape
+    best = np.zeros(shape, np.float32)
+    owner = np.full(shape, -1, np.int32)
+    for i, s in enumerate(spots):
+        v = np.where(s["pix"], np.maximum(diffs[s["address"]], 0) / max(s["peak"], 1e-6), -1)
+        take = v > best
+        owner[take], best[take] = i, v[take]
+    used, emitters, labels = set(), [], np.zeros(shape, np.int32)
+    # primaries first so a good LED keeps its slot
+    for i in sorted(range(len(spots)), key=lambda i: (not spots[i]["primary"], spots[i]["slot"])):
+        s = spots[i]
+        pix = owner == i
+        if pix.sum() < 3:
+            continue
+        sid = s["slot"] if s["slot"] not in used else 100 + s["address"]
+        used.add(sid)
+        emitters.append(dict(id=int(sid), address=int(s["address"]), primary=bool(s["primary"]),
+                             cx=s["cx"], cy=s["cy"], area=int(pix.sum()), lobes=s["lobes"],
+                             flux=s["flux"], dc=float(diffs[s["address"]][pix].mean()), _pix=pix))
+    emitters.sort(key=lambda d: d["id"])
+    for n, d in enumerate(emitters, 1):
+        labels[d.pop("_pix")] = n
+        d["label"] = n
+    med = np.median([d["dc"] for d in emitters if d["primary"]])
+    for d in emitters:
+        d["dc_rel"] = d["dc"] / med if med else float("nan")
+    miswired = [dict(id=d["id"], address=d["address"]) for d in emitters if d["id"] != d["address"]]
+    lobes = [d["lobes"] for d in emitters]
+    report = dict(addresses=addrs, dead=dead, n_leds=len(emitters), pitch_px=abs(p_fit),
+                  miswired=miswired, noise_sigma=sigma,
+                  lobes_hist={str(k): lobes.count(k) for k in sorted(set(lobes))},
+                  multi_spot_addresses={str(a): len(per[a]) for a in live if len(per[a]) > 1})
+    return labels, emitters, report
+
+
+def save_led_map(path_base, labels, emitters, report, img=None, extra=None):
+    np.savez_compressed(path_base + "_ledmap.npz", labels=labels,
+                        emitters=json.dumps(emitters), report=json.dumps(report),
+                        **({"img": img} if img is not None else {}), **(extra or {}))
+    with open(path_base + "_ledmap.json", "w") as fh:
+        json.dump(dict(report=report, emitters=emitters), fh, indent=2)
+    if img is None:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    ys, xs = np.nonzero(labels)
+    pad = 50
+    y0, y1 = max(0, ys.min() - pad), min(img.shape[0], ys.max() + pad)
+    x0, x1 = max(0, xs.min() - pad), min(img.shape[1], xs.max() + pad)
+    fig, ax = plt.subplots(1, 2, figsize=(9, 10))
+    for a_ in ax:
+        a_.imshow(img[y0:y1, x0:x1], cmap="gray", vmin=0, vmax=np.percentile(img[labels > 0], 99),
+                  extent=(x0, x1, y1, y0))
+    ax[1].contour(np.arange(x0, x1), np.arange(y0, y1), labels[y0:y1, x0:x1],
+                  levels=np.arange(0.5, labels.max() + 1), colors="lime", linewidths=0.5)
+    for d in emitters:
+        col = "yellow" if d["id"] == d["address"] else "red"
+        txt = str(d["id"]) if d["id"] == d["address"] else f"{d['id']}<-{d['address']}"
+        ax[1].annotate(txt, (d["cx"] + 18, d["cy"]), color=col, fontsize=7, va="center")
+    ax[0].set_title("all addresses summed (on - off)", fontsize=9)
+    ax[1].set_title(f"{report['n_leds']} LEDs; dead {report['dead']}; "
+                    f"lobes/LED {report['lobes_hist']}", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path_base + "_ledmap.png", dpi=110)
+    plt.close(fig)
+    print(f"  plot -> {path_base}_ledmap.png")
+
+
+def load_led_map(path):
+    z = np.load(path)
+    return z["labels"], json.loads(str(z["emitters"])), json.loads(str(z["report"]))
+
+
+def print_led_map(report, emitters):
+    print(f"[ledmap] {report['n_leds']} LEDs from {len(report['addresses'])} addresses, "
+          f"pitch {report['pitch_px']:.1f} px")
+    print(f"[ledmap] lobes per LED (bright regions inside one LED): {report['lobes_hist']}")
+    if report["dead"]:
+        print(f"[ledmap] dead addresses (light nothing): {report['dead']}")
+    for m in report["miswired"]:
+        print(f"[ledmap] LED in slot {m['id']} is lit by address {m['address']} (miswired)")
+    for d in emitters:
+        print(f"   id {d['id']:3d}  addr {d['address']:2d}  ({d['cx']:7.1f},{d['cy']:7.1f})  "
+              f"area {d['area']:5d}  lobes {d['lobes']}  brightness {d['dc_rel']:.2f}")
+
+
+def cmd_ledmap(a):
+    os.makedirs(OUTDIR, exist_ok=True)
+    kw = dict(close_px=a.close_px, merge_r=a.merge_r, rel=a.rel)
+    if a.from_scan:
+        import glob
+        d = a.from_scan
+        dark = np.load(os.path.join(d, "dark_full.npy")).astype(np.float32)
+        diffs = {}
+        for f in sorted(glob.glob(os.path.join(d, f"D{a.pwm_col}_row[0-9][0-9].npy"))):
+            r = int(f[-6:-4])
+            diffs[r] = np.load(f).astype(np.float32) - dark
+        if not diffs:
+            sys.exit(f"no D{a.pwm_col}_rowNN.npy in {d}")
+        base = os.path.join(OUTDIR, os.path.basename(os.path.normpath(d)) + f"_D{a.pwm_col}")
+        extra = {}
+    else:
+        from led_control import idx_list
+        rows = idx_list(a.rows) if a.rows else list(range(24))
+        driver = ArduinoDriver(a.port, a.baud)
+        cam = Camera("v4l2", a.device, a.pixel_format, a.exposure_us, a.gain)
+        try:
+            driver.col(a.pwm_col)
+            driver.rows(None)
+            driver.off()
+            dark = cam.grab_n(a.frames, a.discard).astype(np.float32).mean(0)
+            diffs = {}
+            for r in rows:
+                driver.rows([r])
+                driver.on()
+                time.sleep(a.settle_s)
+                diffs[r] = cam.grab_n(a.frames, a.discard).astype(np.float32).mean(0) - dark
+                print(f"  address {r:2d}: peak {diffs[r].max():.0f}", flush=True)
+            driver.rows(None)
+            driver.off()
+        finally:
+            try:
+                driver.close()
+            finally:
+                cam.close()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(OUTDIR, f"{stamp}_D{a.pwm_col}")
+        extra = {"dark": dark}
+    labels, emitters, report = build_led_map(diffs, **kw)
+    report.update(pwm_col=a.pwm_col, exposure_us=a.exposure_us, gain=a.gain,
+                  source=a.from_scan or "live")
+    print_led_map(report, emitters)
+    img = np.maximum(sum(diffs.values()), 0)
+    save_led_map(base, labels, emitters, report, img=img, extra=extra)
+    print(f"saved {base}_ledmap.npz / .json  (use: sweep --led-map {base}_ledmap.npz)")
+    return base
 
 
 def emitter_signals(frames: np.ndarray, labels: np.ndarray, n: int,
@@ -835,7 +1085,7 @@ def cmd_sweep(a) -> str:
         # Clipped pixels flatten the roll-off (they stay at full scale while the
         # true level drops). Drop any pixel near full scale with the LED held on,
         # which is the brightest state it will ever see.
-        clipped = roi.mask & (on >= a.sat_level)
+        clipped = (on >= a.sat_level) if a.led_map else roi.mask & (on >= a.sat_level)
         if clipped.any():
             frac = clipped.sum() / roi.mask.sum()
             if frac > 0.01:
@@ -854,7 +1104,22 @@ def cmd_sweep(a) -> str:
         ys, xs = slice(max(0, y - pad), y + h + pad), slice(max(0, x - pad), x + w + pad)
         dc_ref = float(frame_signal(on[None], roi, master_dark)[0])   # LED held on
         crops = {}
-        labels, emitters = segment_emitters(on, off, roi) if a.per_led else (None, [])
+        if a.per_led and a.led_map:
+            # address-based map (each LED lit alone): lobes of one LED stay one
+            if a.hw_crop:
+                sys.exit("--led-map needs the full sensor frame: drop --hw-crop")
+            labels, emitters, _rep = load_led_map(a.led_map)
+            if labels.shape != on.shape:
+                sys.exit(f"--led-map is {labels.shape}, frames are {on.shape}")
+            labels = labels.copy()
+            labels[clipped] = 0
+            # the column background must not overlap any LED of the map
+            roi.bg &= ~_dilate(labels > 0, a.close_px)
+            print(f"[roi] LED map {a.led_map}: {len(emitters)} LEDs (address-based)")
+        elif a.per_led:
+            labels, emitters = segment_emitters(on, off, roi)
+        else:
+            labels, emitters = None, []
         n_em = len(emitters)
         if n_em:
             em_dc = emitter_signals(on[None], labels, n_em, roi, master_dark)[0]
@@ -1367,6 +1632,8 @@ def main(argv=None):
     sw.add_argument("--crop-margin", type=int, default=48)
     sw.add_argument("--no-per-led", dest="per_led", action="store_false",
                     help="skip segmenting individual LEDs")
+    sw.add_argument("--led-map", help="per-LED pixel map from the 'ledmap' command "
+                                      "(groups each LED's lobes into one LED)")
     sw.add_argument("--bin", type=int, default=1,
                     help="software bin factor for the saved per-step ROI crops")
     sw.add_argument("--close-px", type=int, default=7,
@@ -1392,8 +1659,33 @@ def main(argv=None):
     st.add_argument("--leds", type=int, default=0,
                     help="simulate a column of separate LEDs (per-LED test)")
 
+    lm = sub.add_parser("ledmap", help="light each address alone and map every LED's "
+                                       "pixels (all its lobes) -> _ledmap.npz")
+    lm.add_argument("--from-scan", help="build from a saved led_addr_scan_* folder instead "
+                                        "of capturing (needs dark_full.npy, D<col>_rowNN.npy)")
+    lm.add_argument("--pwm-col", type=int, default=9, help="column pin, 3..13")
+    lm.add_argument("--rows", help="addresses to light one at a time (default 0-23)")
+    lm.add_argument("--device", default="/dev/video0")
+    lm.add_argument("--pixel-format", default="RG10")
+    lm.add_argument("--port", default="/dev/ttyACM0")
+    lm.add_argument("--baud", type=int, default=115200)
+    lm.add_argument("--exposure-us", type=int, default=500,
+                    help="keep it unclipped: ~0.5 ms for one LED fully on at 0 dB")
+    lm.add_argument("--gain", type=float, default=0)
+    lm.add_argument("--frames", type=int, default=6)
+    lm.add_argument("--discard", type=int, default=8)
+    lm.add_argument("--settle-s", type=float, default=0.05)
+    lm.add_argument("--close-px", type=int, default=8,
+                    help="closing radius that joins the lobes of one LED across its dark cross")
+    lm.add_argument("--merge-r", type=float, default=25.0,
+                    help="regions of one address closer than this (px) are the same LED")
+    lm.add_argument("--rel", type=float, default=0.12,
+                    help="LED pixels: above this fraction of the address's peak")
+
     a = ap.parse_args(argv)
-    if a.cmd == "analyze":
+    if a.cmd == "ledmap":
+        cmd_ledmap(a)
+    elif a.cmd == "analyze":
         analyze(a.base, k=a.k, fit_max_drop=a.fit_max_drop, knee_drop=a.knee_drop)
     elif a.cmd == "sweep":
         cmd_sweep(a)
